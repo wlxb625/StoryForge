@@ -2,3 +2,7 @@ __pycache__/
 .venv/
 phase0-benchmark/profiles.local.json
 phase0-benchmark/runs/
+node_modules/
+dist/
+src-tauri/target/
+src-tauri/gen/
