@@ -156,7 +156,7 @@ def report(directory):
     private.mkdir(exist_ok=True)
     csv_file(private / "usage.csv", rows, ("call_id", "profile_id", "client", "transport", "request_options", "uses_system_proxy",
                                            "role", "scenario", "beat", "method", "sample",
-                                           "band", "case_id", "score_id", "state", "error", "finish_reason", *USAGE_FIELDS,
+                                           "band", "case_id", "score_id", "source_call", "follow_up", "state", "error", "finish_reason", *USAGE_FIELDS,
                                            "cjk_chars", "writing_usable", "leak_markers", "original_role_pass", "role_pass"))
     totals = {}
     for profile in manifest["profiles"]:
@@ -249,7 +249,12 @@ def calibrate(directory, rating_paths, skill_paths):
     covered = {(profile, scenario) for (profile, scenario, *_), methods in matched.items() if methods == {"baseline", "v3"}}
     missing_comparisons = sorted((identifier, scene["id"]) for identifier in profile_by_id
                                  for scene in manifest["scenarios"] if (identifier, scene["id"]) not in covered)
-    lines = ["# StoryForge V3 Phase 0 校准", "", f"冻结输入 SHA-256 `{manifest['input_sha256']}`", "",
+    lines = ["# StoryForge V3 Phase 0 校准", "", f"冻结输入 SHA-256 `{manifest['input_sha256']}`", ""]
+    lines.extend(f"- {profile['id']} 对应 {profile['model']}" for profile in manifest["profiles"])
+    follow_ups = sum(bool(row.get("follow_up")) for row in rows)
+    if follow_ups:
+        lines.extend(["", f"本批含 {follow_ups} 条补充对照，原调用记录保留。补充请求的理由与原调用编号见用量账单。"])
+    lines.extend(["",
              "| 检查 | 未满足数 |", "| --- | ---: |",
              f"| 失败或远端结果未知 | {len(failed)} |", f"| 等待结果或尚未发送 | {len(pending_calls)} |",
              f"| 可比较场景缺口 | {len(missing_comparisons)} |", f"| 成功调用返回输入输出 token | {len(usage_missing)} |",
@@ -259,7 +264,7 @@ def calibrate(directory, rating_paths, skill_paths):
              f"| 正反例有评分 | {len(unreviewed_skills)} |", "", "## 按模型与参考篇幅", "",
              "费用采用完整用量计算的金额或缺少缓存字段时的保守上界。", "",
              "| 配置 | 方法 | 参考字数 | 通过 / 已评审 / 计划 | 通过样本实际字数范围 | 实际汉字中位数 | 盲评分均值 | 单次估算 USD |",
-             "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: |"]
+             "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: |"])
     stats = {}
     for (profile, method, low, high), group in sorted(groups.items()):
         assessed = [row["mean_rating"] for row in group if row["mean_rating"] is not None]
@@ -311,7 +316,7 @@ def calibrate(directory, rating_paths, skill_paths):
         lines.append(f"成本候选组合为主笔 {writer}、审查 {audit}、提取 {memory}。按每角色各调用一次估算上界 "
                      f"{fmt(writing_cost + audit_cost + memory_cost)} USD。主笔通过率至少 80%，审查和提取须通过全部题例。")
     else:
-        lines.append("待收齐完整结果、人工评分与费用数据，并取得满足门槛的三角色配置。")
+        lines.append("待完成对照与评分，并取得满足门槛的三角色配置。")
     lines.extend(["", "## 首批正反例", ""])
     skill_failures = 0
     for example in examples:
