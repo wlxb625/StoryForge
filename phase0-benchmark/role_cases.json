@@ -1,0 +1,61 @@
+{
+  "审查": [
+    {
+      "id": "secret",
+      "context": "林夏只见过封皮折角变平。她对周宁调包账本一无所知，也不知道真账本藏处。",
+      "passage": "林夏低头摸了摸封皮。她知道周宁把真账本藏进了锅炉夹层，只是现在还不能拆穿。",
+      "expected": ["pov_leak"],
+      "required_quotes": ["真账本", "锅炉夹层"]
+    },
+    {
+      "id": "prop",
+      "context": "黄铜钥匙昨晚锁进仓库，次日还没有人进仓库。手中没有备用钥匙。",
+      "passage": "清早，林夏从自己的裤袋里摸出那把黄铜钥匙，拧开了仓库的门。",
+      "expected": ["canon_conflict"],
+      "required_quotes": ["裤袋", "黄铜钥匙"]
+    },
+    {
+      "id": "allowed-clue",
+      "context": "林夏不知账本曾被调包。她在现场，能看见封面的白胶。",
+      "passage": "她用指甲抠了一点白胶，又把手缩回袖里。也许封皮才修过。她没有开口问。",
+      "expected": []
+    },
+    {
+      "id": "death",
+      "context": "周宁两年前已死亡，眼前的故事是现在时。不存在超自然现象。",
+      "passage": "周宁提着热水从一楼走了上来。他拧开水杯，给林夏倒了一杯白水。",
+      "expected": ["canon_conflict"],
+      "required_quotes": ["周宁", "走了上来"]
+    }
+  ],
+  "提取": [
+    {
+      "id": "transfer",
+      "context": "方青和林夏都在缝纫铺。",
+      "passage": "方青把黄铜钥匙交给林夏。林夏随手把窗关紧。",
+      "expected": ["prop_transfer"],
+      "required_quotes": ["方青", "黄铜钥匙", "林夏"]
+    },
+    {
+      "id": "move",
+      "context": "程玉此前在渡口。",
+      "passage": "程玉离开渡口，赶在饭前进了松木礼堂。",
+      "expected": ["location_move"],
+      "required_quotes": ["程玉", "渡口", "松木礼堂"]
+    },
+    {
+      "id": "counterfactual",
+      "context": "钥匙仍在程玉衣袋。计划还没有执行。",
+      "passage": "要是她真把钥匙给乔雨，明天一早就不用再出门了。程玉摸了摸衣袋。",
+      "expected": [],
+      "required_quotes": []
+    },
+    {
+      "id": "death",
+      "context": "林夏守在病床边。此处发生不可逆的状态变化。",
+      "passage": "医生停下按压，说方青已经死亡，递给林夏一张死亡医学证明书。",
+      "expected": ["death"],
+      "required_quotes": ["方青", "死亡"]
+    }
+  ]
+}

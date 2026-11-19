@@ -1,0 +1,25 @@
+{
+  "id": "04",
+  "title": "人物误解与信息差",
+  "public": "码头临时停运，兄妹俩三天没有说话。程玉拿着一张有水渍的发车单等程敬。",
+  "facts": [
+    {
+      "truth": "王医生接走了程敬的女儿，她正躲在松木礼堂。",
+      "views": {
+        "程敬": {"state": "knows"},
+        "程玉": {"state": "misbelieves", "text": "程玉把发车单上的污渍误认成自己哥哥急着独自出城留下的手印。"}
+      },
+      "observable_clues": ["发车单被人捏皱了，出城那一栏还没盖章。"],
+      "leak_markers": ["松木礼堂", "王医生接走"]
+    }
+  ],
+  "beats": [
+    {
+      "pov": "程玉",
+      "context": "程敬带着干粮回来。他从门口看到了发车单，没有提上面的日期。",
+      "goal": "让误解推动程玉做错一件有代价的小事。误解保留可被纠正的空间。",
+      "tone": "委屈、克制",
+      "techniques": ["skill.dialogue.subtext", "skill.emotion.objects"]
+    }
+  ]
+}

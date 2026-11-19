@@ -1,0 +1,23 @@
+{
+  "profiles": [
+    {
+      "id": "route-a",
+      "base_url": "https://provider-a.example/v1",
+      "model": "model-a",
+      "api_key_env": "STORYFORGE_A_KEY",
+      "options": {},
+      "billing_usd_per_million": null
+    },
+    {
+      "id": "route-b",
+      "base_url": "https://provider-b.example/v1",
+      "model": "model-b",
+      "api_key_env": "STORYFORGE_B_KEY",
+      "options": {},
+      "billing_usd_per_million": null
+    }
+  ],
+  "bands": [[400, 600], [700, 1100], [1200, 1600]],
+  "repetitions": 1,
+  "shuffle_seed": 1319
+}
