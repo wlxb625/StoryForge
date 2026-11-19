@@ -10,7 +10,7 @@ python -X utf8 phase0-benchmark/run_benchmark.py plan --config phase0-benchmark/
 
 | 验证项 | 结果 |
 | --- | --- |
-| 单元与本机 HTTP 集成测试 | 12 项通过 |
+| 单元与本机 HTTP 集成测试 | 13 项通过 |
 | 场景、节拍、Skill 与角色案例 | 10 个场景、13 个节拍、4 项 Skill、8 个审查与提取案例通过校验 |
 | 三个参考篇幅下的双方法矩阵 | 两组配置共计划 172 次调用 |
 | 林夏 POV | 三个篇幅下均剥离秘密本体，保留可见线索。污染文本在请求前被拒绝 |

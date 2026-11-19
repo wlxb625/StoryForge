@@ -4,7 +4,7 @@
 
 ## 开发进度
 
-Phase 0 已实现多模型盲测套件。十个标准场景、POV 物理隔离、真实调用留痕、匿名评审和校准脚本都在 [phase0-benchmark](phase0-benchmark/README.md)。目前等待真实模型用量数据与盲评分数，通过后进入 Tauri 桌面端。
+Phase 0 已实现多模型盲测套件。十个标准场景、POV 物理隔离、真实调用留痕、匿名评审和校准脚本都在 [phase0-benchmark](phase0-benchmark/README.md)。已启动真实模型跑测，验收完成后进入 Tauri 桌面端。
 
 | 阶段 | 目标 |
 | --- | --- |

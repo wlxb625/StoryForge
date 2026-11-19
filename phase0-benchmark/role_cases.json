@@ -55,7 +55,10 @@
       "context": "林夏守在病床边。此处发生不可逆的状态变化。",
       "passage": "医生停下按压，说方青已经死亡，递给林夏一张死亡医学证明书。",
       "expected": ["death"],
-      "required_quotes": ["方青", "死亡"]
+      "required_quotes": ["方青", "死亡"],
+      "optional_events": {
+        "prop_transfer": ["递给", "林夏", "死亡医学证明书"]
+      }
     }
   ]
 }

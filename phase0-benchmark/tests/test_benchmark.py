@@ -82,6 +82,12 @@ class BenchmarkTests(unittest.TestCase):
         self.assertFalse(grade_role(case, '[{"type":"prop_transfer","quote":"方青把钥匙交给林夏。"}]'))
         self.assertTrue(grade_role(self.cases["审查"][2], "[]"))
         self.assertFalse(grade_role(self.cases["审查"][0], "[]"))
+        death = self.cases["提取"][3]
+        answer = [{"type": "death", "quote": "方青已经死亡"},
+                  {"type": "prop_transfer", "quote": "递给林夏一张死亡医学证明书"}]
+        self.assertTrue(grade_role(death, json.dumps(answer, ensure_ascii=False)))
+        answer[1]["quote"] = "医生停下按压"
+        self.assertFalse(grade_role(death, json.dumps(answer, ensure_ascii=False)))
 
     def test_sse_preserves_text_usage_and_partial_output(self):
         def event(payload):
@@ -293,6 +299,25 @@ class BenchmarkTests(unittest.TestCase):
             self.assertEqual(carried[0]["state"], "outcome_unknown")
             self.assertEqual(carried[0]["source_call"]["call_id"], keep)
             self.assertTrue(all(row["state"] == "queued" for row in rows if row["profile_id"] == "route-a"))
+
+    def test_clarified_extraction_rubric_keeps_original_result(self):
+        manifest, jobs = plan(self.config)
+        job = copy.deepcopy(next(job for job in jobs if job["role"] == "提取" and job["case_id"] == "death"))
+        del job["case"]["optional_events"]
+        answers = [{"type": "death", "quote": "方青已经死亡"},
+                   {"type": "prop_transfer", "quote": "递给林夏一张死亡医学证明书"}]
+        original = {"state": "completed", "content": json.dumps(answers, ensure_ascii=False),
+                    "finish_reason": "stop", "role_pass": False}
+        with tempfile.TemporaryDirectory() as working:
+            directory = Path(working) / "run"
+            initialize(directory, manifest, [job])
+            with connect(directory) as db:
+                db.execute("UPDATE calls SET state='completed', result_json=?", (json.dumps(original),))
+            _, outcomes = load_run(directory)
+            self.assertFalse(outcomes[0]["original_role_pass"])
+            self.assertTrue(outcomes[0]["role_pass"])
+            with connect(directory) as db:
+                self.assertEqual(json.loads(db.execute("SELECT result_json FROM calls").fetchone()[0]), original)
 
 
 if __name__ == "__main__":

@@ -11,7 +11,7 @@ import sqlite3
 from statistics import mean, median
 from urllib.parse import urlsplit
 
-from benchmark_core import DIMENSIONS, price_usage, read_json, require, validate_config
+from benchmark_core import DIMENSIONS, ROOT, grade_role, price_usage, read_json, require, validate_config
 
 
 TOKEN_FIELDS = ("prompt_tokens", "cached_tokens", "cache_write_tokens", "completion_tokens")
@@ -37,10 +37,18 @@ def load_run(directory):
         valuation = read_json(pricing)
         require(valuation["input_sha256"] == manifest["input_sha256"], "计费单价对应其他跑测批次")
         prices_by_id.update(valuation["prices"])
+    current_cases = {(role, case["id"]): case for role, cases in read_json(ROOT / "role_cases.json").items() for case in cases}
     for item in items:
         prices = prices_by_id.get(item["profile_id"])
         if prices is not None:
             item.update(price_usage({key: item.get(key) for key in TOKEN_FIELDS}, prices))
+        case = item.get("case")
+        updated = current_cases.get((item["role"], item.get("case_id")))
+        if (item["state"] == "completed" and case and updated and "optional_events" not in case
+                and {key: value for key, value in updated.items() if key != "optional_events"} == case
+                and updated.get("optional_events") and item.get("finish_reason") in {None, "stop"}):
+            item["original_role_pass"] = item.get("role_pass")
+            item["role_pass"] = grade_role(updated, item["content"])
     return manifest, items
 
 
@@ -149,7 +157,7 @@ def report(directory):
     csv_file(private / "usage.csv", rows, ("call_id", "profile_id", "client", "transport", "request_options", "uses_system_proxy",
                                            "role", "scenario", "beat", "method", "sample",
                                            "band", "case_id", "score_id", "state", "error", "finish_reason", *USAGE_FIELDS,
-                                           "cjk_chars", "writing_usable", "leak_markers", "role_pass"))
+                                           "cjk_chars", "writing_usable", "leak_markers", "original_role_pass", "role_pass"))
     totals = {}
     for profile in manifest["profiles"]:
         profile_rows = [row for row in rows if row["profile_id"] == profile["id"]]
@@ -232,6 +240,7 @@ def calibrate(directory, rating_paths, skill_paths):
     unreviewed = [row for row in writing if reviewable(row) and not ratings.get(row["score_id"])]
     pov_fails = [row for row in writing if row["scenario"] == "03" and row["method"] == "v3"
                  and (row["human_leak"] or row.get("leak_markers"))]
+    ledger_reviews_pending = [row for row in unreviewed if row["scenario"] == "03" and row["method"] == "v3"]
     unreviewed_skills = [example for example in examples if not skill_ratings.get(example["example"])]
     matched = defaultdict(set)
     for row in writing:
@@ -245,10 +254,11 @@ def calibrate(directory, rating_paths, skill_paths):
              f"| 失败或远端结果未知 | {len(failed)} |", f"| 等待结果或尚未发送 | {len(pending_calls)} |",
              f"| 可比较场景缺口 | {len(missing_comparisons)} |", f"| 成功调用返回输入输出 token | {len(usage_missing)} |",
              f"| 费用可估算 | {sum(row.get('cost_usd') is None and row.get('cost_upper_usd') is None for row in rows)} |",
-             f"| 正文有评分 | {len(unreviewed)} |", f"| 场景 03 V3 已知泄密 | {len(pov_fails)} |",
+             f"| 正文待评分 | {len(unreviewed)} |", f"| 场景 03 V3 待评审 | {len(ledger_reviews_pending)} |",
+             f"| 场景 03 V3 已知泄密 | {len(pov_fails)} |",
              f"| 正反例有评分 | {len(unreviewed_skills)} |", "", "## 按模型与参考篇幅", "",
              "费用采用完整用量计算的金额或缺少缓存字段时的保守上界。", "",
-             "| 配置 | 方法 | 参考字数 | 通过 / 全部 | 通过样本实际字数范围 | 实际汉字中位数 | 盲评分均值 | 单次估算 USD |",
+             "| 配置 | 方法 | 参考字数 | 通过 / 已评审 / 计划 | 通过样本实际字数范围 | 实际汉字中位数 | 盲评分均值 | 单次估算 USD |",
              "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: |"]
     stats = {}
     for (profile, method, low, high), group in sorted(groups.items()):
@@ -259,23 +269,25 @@ def calibrate(directory, rating_paths, skill_paths):
         passed = sum(row["pass"] for row in group)
         cost = average_cost(group)
         stats[(profile, method, low, high)] = (passed, len(group), len(assessed), mean(assessed) if assessed else 0, cost)
-        lines.append(f"| {profile} | {method} | {low}–{high} | {passed}/{len(group)} | {actual_range} | "
+        lines.append(f"| {profile} | {method} | {low}–{high} | {passed}/{len(assessed)}/{len(group)} | {actual_range} | "
                      f"{median(counts) if counts else '未知'} | {fmt(mean(assessed) if assessed else None, 2)} | {fmt(cost)} |")
     lines.extend(["", "### 篇幅候选", ""])
     options = []
     length_calibrated = 0
     for profile in profile_by_id:
-        eligible = [(passed / total, score, low, high, cost)
-                    for (identifier, method, low, high), (passed, total, rated, score, cost) in stats.items()
+        observed_bands = {tuple(row["band"]) for row in writing
+                          if row["profile_id"] == profile and row["method"] == "v3" and row.get("writing_usable")}
+        eligible = [(passed / rated, score, low, high, cost)
+                    for (identifier, method, low, high), (passed, _, rated, score, cost) in stats.items()
                     if identifier == profile and method == "v3" and rated and passed > 0]
+        length_calibrated += len(observed_bands) == len(manifest["bands"])
         if eligible:
-            length_calibrated += 1
             rate, score, low, high, cost = max(eligible, key=lambda item: (item[0], item[1], -abs(item[3] - item[2])))
             lines.append(f"- {profile} · {low}–{high} 汉字 · 通过率 {rate:.0%} · 均分 {score:.2f}")
             if rate >= 0.8 and cost is not None:
                 options.append((profile, cost))
         else:
-            lines.append(f"- {profile} · 待取得完整评分与通过样本")
+            lines.append(f"- {profile} · 本轮暂无通过评审的篇幅区间。已取得 {len(observed_bands)} 档完整输出。")
     lines.extend(["", "## 审查与提取", "", "| 角色 | 配置 | 合格 / 全部 | 中位耗时 ms | 单次估算 USD |",
                   "| --- | --- | ---: | ---: | ---: |"])
     candidates = defaultdict(list)
@@ -288,8 +300,10 @@ def calibrate(directory, rating_paths, skill_paths):
         if passed == len(group) and cost is not None:
             candidates[role].append((cost, latency, profile))
     lines.append("")
+    if any("original_role_pass" in row for row in rows):
+        lines.append("死亡题例允许同时报告有原文证据的死亡证明交接。原始调用和首判保留在日志中，补充口径仅离线重判。")
     routes_ready = bool(options and candidates["审查"] and candidates["提取"]
-                        and not (usage_missing or unreviewed or pov_fails or pending_calls or missing_comparisons))
+                        and not (usage_missing or ledger_reviews_pending or pov_fails or pending_calls or missing_comparisons))
     if routes_ready:
         writer, writing_cost = min(options, key=lambda item: item[1])
         audit_cost, _, audit = min(candidates["审查"])
@@ -318,6 +332,7 @@ def calibrate(directory, rating_paths, skill_paths):
     (directory / "private").mkdir(exist_ok=True)
     (directory / "private" / "calibration.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
     gate = {"passed": gate_passed, "pov_leaks": len(pov_fails), "missing_ratings": len(unreviewed),
+            "ledger_reviews_pending": len(ledger_reviews_pending),
             "failed_calls": len(failed), "pending_calls": len(pending_calls), "missing_comparisons": missing_comparisons,
             "ledger_without_sample": ledger_without_sample, "skill_examples_pending": skill_failures,
             "reviewed_samples": len(ratings), "reviewed_examples": len(skill_ratings)}

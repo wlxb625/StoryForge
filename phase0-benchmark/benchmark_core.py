@@ -230,14 +230,24 @@ def grade_role(case, output):
         answers = json.loads(re.sub(r"^\s*```(?:json)?\s*|\s*```\s*$", "", output))
     except ValueError:
         return False
-    if not isinstance(answers, list) or len(answers) != len(case["expected"]):
+    if not isinstance(answers, list):
         return False
-    return all(
-        isinstance(answer, dict) and answer.get("type") == expected
-        and isinstance(quote := answer.get("quote"), str) and quote.strip() and quote in case["passage"]
-        and all(fragment in quote for fragment in case.get("required_quotes", []))
-        for answer, expected in zip(answers, case["expected"], strict=True)
-    )
+    required = set(case["expected"])
+    optional = case.get("optional_events", {})
+    seen = set()
+    for answer in answers:
+        if not isinstance(answer, dict):
+            return False
+        kind, quote = answer.get("type"), answer.get("quote")
+        if not isinstance(kind, str) or kind in seen or (kind not in required and kind not in optional):
+            return False
+        fragments = case.get("required_quotes", []) if kind in required else optional[kind]
+        if not isinstance(quote, str) or not quote.strip() or quote not in case["passage"]:
+            return False
+        if any(fragment not in quote for fragment in fragments):
+            return False
+        seen.add(kind)
+    return required <= seen
 
 
 def parse_usage(response):

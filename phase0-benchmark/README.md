@@ -32,6 +32,8 @@ python run_benchmark.py run --config profiles.local.json
 
 评审员使用运行目录中的 `blind-review.md`、`rubric.md`、`skill-review.md` 和两份 CSV 模板。每位评审员复制模板后独立填写。匿名稿按节拍分组，隐藏分组方法、模型和端点。保留 `ledger.sqlite3` 和 `private/` 供跑测人员审核和复核。
 
+场景可采用配对抽样评审。每组模型在十个场景中都需要同节拍、同字数区间的传统和 V3 完整样本。场景 03 送审所有已生成的 V3 正文。报告显示总样本、已评审样本与通过样本数。
+
 ```powershell
 python run_benchmark.py calibrate --run runs/<运行目录> --ratings ratings.csv --skills skills.csv
 ```
