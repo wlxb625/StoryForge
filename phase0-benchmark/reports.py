@@ -11,10 +11,11 @@ import sqlite3
 from statistics import mean, median
 from urllib.parse import urlsplit
 
-from benchmark_core import DIMENSIONS, require
+from benchmark_core import DIMENSIONS, price_usage, read_json, require, validate_config
 
 
-USAGE_FIELDS = ("prompt_tokens", "cached_tokens", "completion_tokens", "cost_usd", "latency_ms")
+TOKEN_FIELDS = ("prompt_tokens", "cached_tokens", "cache_write_tokens", "completion_tokens")
+USAGE_FIELDS = (*TOKEN_FIELDS, "cost_usd", "cost_lower_usd", "cost_upper_usd", "latency_ms")
 RATING_FIELDS = ("sample", *DIMENSIONS, "pov_leak", "evidence")
 SKILL_FIELDS = ("example", "score", "evidence")
 
@@ -26,12 +27,38 @@ def load_run(directory):
         require(run_start, "运行目录缺少冻结输入")
         manifest = json.loads(run_start[0])
         items = []
-        for call_id, recorded_state, source, result in db.execute(
+        for call_id, state, source, result in db.execute(
             "SELECT call_id, state, input_json, result_json FROM calls ORDER BY call_id"
         ):
-            state = "outcome_unknown" if recorded_state == "running" else recorded_state
             items.append({"call_id": call_id, **json.loads(source), **(json.loads(result) if result else {}), "state": state})
+    prices_by_id = {p["id"]: p.get("billing_usd_per_million") for p in manifest["profiles"]}
+    pricing = directory / "private" / "pricing.json"
+    if pricing.is_file():
+        valuation = read_json(pricing)
+        require(valuation["input_sha256"] == manifest["input_sha256"], "计费单价对应其他跑测批次")
+        prices_by_id.update(valuation["prices"])
+    for item in items:
+        prices = prices_by_id.get(item["profile_id"])
+        if prices is not None:
+            item.update(price_usage({key: item.get(key) for key in TOKEN_FIELDS}, prices))
     return manifest, items
+
+
+def reprice(directory, config):
+    updated, _, _ = validate_config(config)
+    manifest, _ = load_run(directory)
+    routes = {profile["id"]: profile for profile in manifest["profiles"]}
+    require({profile["id"] for profile in updated} == set(routes), "计费单价须对应同一组路由 ID")
+    prices = {}
+    for profile in updated:
+        old = routes[profile["id"]]
+        require(profile["model"] == old["model"] and profile["base_url"].rstrip("/") == old["base_url"].rstrip("/"),
+                f"{profile['id']} 的模型或接口与冻结记录不一致")
+        prices[profile["id"]] = profile.get("billing_usd_per_million")
+    file = directory / "private" / "pricing.json"
+    file.parent.mkdir(exist_ok=True)
+    file.write_text(json.dumps({"input_sha256": manifest["input_sha256"], "prices": prices}, indent=2), encoding="utf-8")
+    report(directory)
 
 
 def scrubber(manifest, rows):
@@ -48,11 +75,20 @@ def quote_markdown(text):
 
 
 def csv_file(path, rows, fields, new_only=False):
+    mode = "w"
     if new_only and path.exists():
-        return
-    with path.open("w", encoding="utf-8-sig", newline="") as stream:
+        with path.open(encoding="utf-8-sig", newline="") as existing:
+            reader = csv.DictReader(existing)
+            require(tuple(reader.fieldnames or ()) == fields, f"{path.name} 列名与模板不符")
+            saved = {row[fields[0]] for row in reader}
+        rows = [row for row in rows if row[fields[0]] not in saved]
+        if not rows:
+            return
+        mode = "a"
+    with path.open(mode, encoding="utf-8-sig", newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames=fields, extrasaction="ignore")
-        writer.writeheader()
+        if mode == "w":
+            writer.writeheader()
         writer.writerows(rows)
 
 
@@ -110,7 +146,8 @@ def report(directory):
     csv_file(directory / "skills-template.csv", examples, SKILL_FIELDS, new_only=True)
     private = directory / "private"
     private.mkdir(exist_ok=True)
-    csv_file(private / "usage.csv", rows, ("call_id", "profile_id", "role", "scenario", "beat", "method", "sample",
+    csv_file(private / "usage.csv", rows, ("call_id", "profile_id", "client", "transport", "request_options", "uses_system_proxy",
+                                           "role", "scenario", "beat", "method", "sample",
                                            "band", "case_id", "score_id", "state", "error", "finish_reason", *USAGE_FIELDS,
                                            "cjk_chars", "writing_usable", "leak_markers", "role_pass"))
     totals = {}
@@ -128,7 +165,7 @@ def report(directory):
     remaining = [row for row in ledger if row["state"] != "completed"]
     summary = {"frozen_inputs_sha256": manifest["input_sha256"], "states": Counter(row["state"] for row in rows),
                "ledger_pov_marker_hits": fixture_issues, "ledger_pov_outputs_missing": len(remaining),
-               "human_review": "pending"}
+               "review": "pending"}
     (private / "run-status.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
@@ -160,7 +197,8 @@ def read_ratings(paths, fields, allowed_ids, evidence_for):
 
 
 def average_cost(rows):
-    values = [row.get("cost_usd") for row in rows]
+    values = [row.get("cost_usd") if row.get("cost_usd") is not None else row.get("cost_upper_usd") for row in rows
+              if row["state"] == "completed"]
     return mean(values) if values and all(value is not None for value in values) else None
 
 
@@ -187,18 +225,29 @@ def calibrate(directory, rating_paths, skill_paths):
                            and not row["human_leak"] and not row.get("leak_markers")
                            and all(mean(score[d] for score in review) >= 4 for d in ("pov", "continuity")))
         groups[(row["profile_id"], row["method"], *row["band"])].append(row)
-    failed = [row for row in rows if row["state"] != "completed"]
-    usage_missing = [row for row in rows if row.get("prompt_tokens") is None or row.get("completion_tokens") is None]
-    unreviewed = [row for row in writing if not ratings.get(row["score_id"])]
+    failed = [row for row in rows if row["state"] in {"failed", "outcome_unknown"}]
+    pending_calls = [row for row in rows if row["state"] in {"queued", "paused", "running"}]
+    usage_missing = [row for row in rows if row["state"] == "completed"
+                     and (row.get("prompt_tokens") is None or row.get("completion_tokens") is None)]
+    unreviewed = [row for row in writing if reviewable(row) and not ratings.get(row["score_id"])]
     pov_fails = [row for row in writing if row["scenario"] == "03" and row["method"] == "v3"
                  and (row["human_leak"] or row.get("leak_markers"))]
     unreviewed_skills = [example for example in examples if not skill_ratings.get(example["example"])]
+    matched = defaultdict(set)
+    for row in writing:
+        if row.get("writing_usable") and row["mean_rating"] is not None:
+            matched[(row["profile_id"], row["scenario"], row["beat"], tuple(row["band"]), row["sample"])].add(row["method"])
+    covered = {(profile, scenario) for (profile, scenario, *_), methods in matched.items() if methods == {"baseline", "v3"}}
+    missing_comparisons = sorted((identifier, scene["id"]) for identifier in profile_by_id
+                                 for scene in manifest["scenarios"] if (identifier, scene["id"]) not in covered)
     lines = ["# StoryForge V3 Phase 0 校准", "", f"冻结输入 SHA-256 `{manifest['input_sha256']}`", "",
              "| 检查 | 未满足数 |", "| --- | ---: |",
-             f"| 调用完成 | {len(failed)} |", f"| 输入和输出 token 由供应商返回 | {len(usage_missing)} |",
-             f"| 费用可估算 | {sum(row.get('cost_usd') is None for row in rows)} |",
+             f"| 失败或远端结果未知 | {len(failed)} |", f"| 等待结果或尚未发送 | {len(pending_calls)} |",
+             f"| 可比较场景缺口 | {len(missing_comparisons)} |", f"| 成功调用返回输入输出 token | {len(usage_missing)} |",
+             f"| 费用可估算 | {sum(row.get('cost_usd') is None and row.get('cost_upper_usd') is None for row in rows)} |",
              f"| 正文有评分 | {len(unreviewed)} |", f"| 场景 03 V3 已知泄密 | {len(pov_fails)} |",
              f"| 正反例有评分 | {len(unreviewed_skills)} |", "", "## 按模型与参考篇幅", "",
+             "费用采用完整用量计算的金额或缺少缓存字段时的保守上界。", "",
              "| 配置 | 方法 | 参考字数 | 通过 / 全部 | 通过样本实际字数范围 | 实际汉字中位数 | 盲评分均值 | 单次估算 USD |",
              "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: |"]
     stats = {}
@@ -218,7 +267,7 @@ def calibrate(directory, rating_paths, skill_paths):
     for profile in profile_by_id:
         eligible = [(passed / total, score, low, high, cost)
                     for (identifier, method, low, high), (passed, total, rated, score, cost) in stats.items()
-                    if identifier == profile and method == "v3" and rated == total and passed > 0]
+                    if identifier == profile and method == "v3" and rated and passed > 0]
         if eligible:
             length_calibrated += 1
             rate, score, low, high, cost = max(eligible, key=lambda item: (item[0], item[1], -abs(item[3] - item[2])))
@@ -240,12 +289,12 @@ def calibrate(directory, rating_paths, skill_paths):
             candidates[role].append((cost, latency, profile))
     lines.append("")
     routes_ready = bool(options and candidates["审查"] and candidates["提取"]
-                        and not (failed or usage_missing or unreviewed or pov_fails))
+                        and not (usage_missing or unreviewed or pov_fails or pending_calls or missing_comparisons))
     if routes_ready:
         writer, writing_cost = min(options, key=lambda item: item[1])
         audit_cost, _, audit = min(candidates["审查"])
         memory_cost, _, memory = min(candidates["提取"])
-        lines.append(f"成本候选组合为主笔 {writer}、审查 {audit}、提取 {memory}。按每角色各调用一次估算 "
+        lines.append(f"成本候选组合为主笔 {writer}、审查 {audit}、提取 {memory}。按每角色各调用一次估算上界 "
                      f"{fmt(writing_cost + audit_cost + memory_cost)} USD。主笔通过率至少 80%，审查和提取须通过全部题例。")
     else:
         lines.append("待收齐完整结果、人工评分与费用数据，并取得满足门槛的三角色配置。")
@@ -258,15 +307,19 @@ def calibrate(directory, rating_paths, skill_paths):
         skill_failures += label != "通过"
         lines.append(f"- `{example['example']}` · {label} · {fmt(score, 2)}")
     ledger = [row for row in writing if row["scenario"] == "03" and row["method"] == "v3"]
-    ledger_unusable = sum(not row.get("writing_usable") for row in ledger)
-    gate_passed = routes_ready and length_calibrated == len(profile_by_id) and not skill_failures and not ledger_unusable
+    ledger_covered = {row["profile_id"] for row in ledger if row.get("writing_usable") and row["mean_rating"] is not None}
+    ledger_without_sample = len(profile_by_id.keys() - ledger_covered)
+    gate_passed = routes_ready and length_calibrated == len(profile_by_id) and not skill_failures and not ledger_without_sample
     lines.extend(["", "## Phase 0 验收", "", f"结果 {'通过' if gate_passed else '待完成'}。"
-                  f" 场景 03 V3 正文技术异常 {ledger_unusable} 份。待校准配置 {len(profile_by_id) - length_calibrated} 组。",
+                  f" 场景 03 V3 缺少已评审完整样本的配置 {ledger_without_sample} 组。待校准配置 {len(profile_by_id) - length_calibrated} 组。",
                   "80% 通过率和 4 分为本轮建议的评分阈值，可依据真实盲评结果在 ADR 中调整。"])
+    if missing_comparisons:
+        lines.extend(["", "缺少同条件已评审对照的场景 " + "、".join(f"{identifier}/{scene}" for identifier, scene in missing_comparisons)])
     (directory / "private").mkdir(exist_ok=True)
     (directory / "private" / "calibration.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
     gate = {"passed": gate_passed, "pov_leaks": len(pov_fails), "missing_ratings": len(unreviewed),
-            "failed_calls": len(failed), "ledger_unusable": ledger_unusable, "skill_examples_pending": skill_failures,
+            "failed_calls": len(failed), "pending_calls": len(pending_calls), "missing_comparisons": missing_comparisons,
+            "ledger_without_sample": ledger_without_sample, "skill_examples_pending": skill_failures,
             "reviewed_samples": len(ratings), "reviewed_examples": len(skill_ratings)}
     (directory / "private" / "exit-gate.json").write_text(json.dumps(gate, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"Phase 0 验收 {'通过' if gate_passed else '待完成'}。校准报告见 private/calibration.md。")

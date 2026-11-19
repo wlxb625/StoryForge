@@ -15,14 +15,18 @@ Copy-Item profiles.example.json profiles.local.json
 
 修改本机配置的 `base_url` 和 `model`，并在启动终端加载 `api_key_env` 指定的环境变量。服务无需凭据时可将 `api_key_env` 设为 `null`。基地址可包括 `/v1` 或完整的 `/chat/completions`。如中转站要求指定较大的输出上限，可按提供方选择 `options.max_tokens` 或 `options.max_completion_tokens`。
 
-`billing_usd_per_million` 接受 `input`、`output` 和可选的 `cached_input`，价格取自本次实际路由。省略缓存单价时按普通输入单价估算。缓存优惠存在且提供方未给出缓存量时，单次费用留空。未返回的用量以空值保存。
+`billing_usd_per_million` 接受 `input`、`output`、可选的 `cached_input` 与 `cache_write`。档位价格可用 `max_prompt_tokens` 限定适用范围，用量超过后该次费用留空。缓存用量缺失时保留空值，账单按可能的输入类别给出估算区间。有完整用量时给出单次估算。
 
 ```powershell
 python run_benchmark.py plan --config profiles.local.json
 python run_benchmark.py run --config profiles.local.json
 ```
 
-默认两组模型共 172 次调用。遇到失败立即记录该条状态并继续其他独立样本。超时、连接异常或服务端错误记录为 `outcome_unknown`。每条调用只发送一次。若进程被强制结束，可用 `report --run <目录>` 从 SQLite 日志重建已有报告。
+默认两组模型共 172 次调用。每条路由最多一个在途请求，连续三次异常时暂停该路由的未发送样本。超时、连接异常或服务端错误记录为 `outcome_unknown`。每条调用只发送一次。若进程被强制结束，可用 `report --run <目录>` 从 SQLite 日志重建已有报告。
+
+中断后，通过 `resume --run <目录>` 继续未发送的样本。已完成、失败或远端结果未知的调用均保留原状态。指定 `--profile <路由 ID>` 后，可以用 `--stream` 或 `--json` 更改尚未发送样本的传输方式，用 `--direct` 直连，或用 `--limit` 限制试跑数量。切换模型重组对比时，可在新一轮 `run` 中传入 `--reuse-from <原目录>`，沿用已停稳批次中未变更路由的历史调用。补充价格后，用 `reprice --run <目录> --config profiles.local.json` 重算账单，冻结的请求和供应商返回的用量原样保留。
+
+部分中转站需使用系统网络客户端，可配置 `"http_client": "curl"`，或为指定路由的续跑加入 `--curl`。该选项使用系统已安装的 curl，凭据由标准输入传入。
 
 ## 盲评与校准
 

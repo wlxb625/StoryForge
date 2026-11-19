@@ -14,11 +14,11 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from benchmark_core import (
-    ROOT, blocked_terms, corpus, estimate_cost, find_leaks, grade_role,
-    parse_usage, read_json, request_model, writing_prompt,
+    ROOT, blocked_terms, corpus, curl_executable, estimate_cost, find_leaks, grade_role,
+    parse_usage, price_usage, read_json, read_stream, request_model, writing_prompt,
 )
-from reports import RATING_FIELDS, SKILL_FIELDS, calibrate, csv_file, load_run, skill_examples
-from run_benchmark import connect, evaluate, initialize, plan, run, run_one
+from reports import RATING_FIELDS, SKILL_FIELDS, calibrate, csv_file, load_run, report, reprice, skill_examples
+from run_benchmark import connect, evaluate, initialize, plan, resume, run, run_one
 
 
 class BenchmarkTests(unittest.TestCase):
@@ -63,13 +63,17 @@ class BenchmarkTests(unittest.TestCase):
 
     def test_reported_zero_and_unknown_are_distinct(self):
         usage = parse_usage({"usage": {"prompt_tokens": 50, "completion_tokens": 3}})
-        self.assertEqual(usage, {"prompt_tokens": 50, "cached_tokens": None, "completion_tokens": 3})
+        self.assertEqual(usage, {"prompt_tokens": 50, "cached_tokens": None, "cache_write_tokens": None, "completion_tokens": 3})
         prices = {"input": 2, "cached_input": 0.2, "output": 5}
         self.assertIsNone(estimate_cost(usage, prices))
         self.assertEqual(estimate_cost({**usage, "cached_tokens": 0}, prices), 0.000115)
         self.assertEqual(estimate_cost({**usage, "cached_tokens": 20}, prices), 0.000079)
         self.assertIsNone(estimate_cost({**usage, "cached_tokens": 51}, prices))
         self.assertEqual(parse_usage({"usage": {"prompt_tokens_details": {"cached_tokens": 0}}})["cached_tokens"], 0)
+        self.assertEqual(price_usage(usage, {**prices, "cache_write": 3}),
+                         {"cost_usd": None, "cost_lower_usd": 0.000025, "cost_upper_usd": 0.000165})
+        self.assertEqual(price_usage({**usage, "cached_tokens": 0, "cache_write_tokens": 20}, {**prices, "cache_write": 3})["cost_usd"], 0.000135)
+        self.assertIsNone(price_usage(usage, {**prices, "max_prompt_tokens": 49})["cost_upper_usd"])
 
     def test_role_checks_require_real_evidence(self):
         case = self.cases["提取"][0]
@@ -78,6 +82,27 @@ class BenchmarkTests(unittest.TestCase):
         self.assertFalse(grade_role(case, '[{"type":"prop_transfer","quote":"方青把钥匙交给林夏。"}]'))
         self.assertTrue(grade_role(self.cases["审查"][2], "[]"))
         self.assertFalse(grade_role(self.cases["审查"][0], "[]"))
+
+    def test_sse_preserves_text_usage_and_partial_output(self):
+        def event(payload):
+            return ("data: " + json.dumps(payload, ensure_ascii=False) + "\r\n\r\n").encode()
+
+        content = event({"model": "fixture", "choices": [{"delta": {"content": "林夏合上了账册。"}}]})
+        reasoning = event({"choices": [{"delta": {"reasoning_content": "模型推理"}}]})
+        finish = event({"choices": [{"delta": {}, "finish_reason": "stop"}]})
+        metering = event({"choices": [], "usage": {"prompt_tokens": 20, "completion_tokens": 12}})
+        states = {"state": "outcome_unknown", "content": "", "finish_reason": None, "reported_model": None}
+        complete = {**states}
+        usage = parse_usage({})
+        read_stream(io.BytesIO(reasoning + content + finish + metering + b"data: [DONE]\n\n"), complete, usage)
+        self.assertEqual(complete["state"], "completed")
+        self.assertEqual(complete["finish_reason"], "stop")
+        self.assertEqual(complete["content"], "林夏合上了账册。")
+        self.assertEqual(usage, {"prompt_tokens": 20, "completion_tokens": 12, "cached_tokens": None, "cache_write_tokens": None})
+        read_stream(io.BytesIO(content), states, parse_usage({}))
+        self.assertEqual(states["state"], "outcome_unknown")
+        self.assertEqual(states["error"], "INCOMPLETE_STREAM")
+        self.assertEqual(states["content"], "林夏合上了账册。")
 
     def test_credential_missing_fails_before_run_creation(self):
         manifest, jobs = plan(self.config)
@@ -151,6 +176,16 @@ class BenchmarkTests(unittest.TestCase):
                     profile = {**config["profiles"][0], "model": "fixture-redirect"}
                     self.assertEqual(request_model(profile, "fixture-key", "body", 5)["error"], "HTTP_307")
                     self.assertEqual(len(seen), 3)
+                    if curl_executable():
+                        curl_profile = {**config["profiles"][0], "http_client": "curl", "use_system_proxy": False}
+                        curl_result = request_model(curl_profile, "fixture-key", "不含秘密的普通请求", 5)
+                        self.assertEqual(curl_result["state"], "completed")
+                        self.assertEqual(curl_result["cached_tokens"], 0)
+                        self.assertEqual(seen[-1][1], "Bearer fixture-key")
+                        self.assertEqual(seen[-1][2]["messages"][0]["content"], "不含秘密的普通请求")
+                        self.assertEqual(request_model({**curl_profile, "model": "fixture-redirect"},
+                                                       "fixture-key", "body", 5)["error"], "HTTP_307")
+                        self.assertEqual(len(seen), 5)
             finally:
                 server.shutdown()
                 thread.join(timeout=5)
@@ -191,6 +226,73 @@ class BenchmarkTests(unittest.TestCase):
                 csv_file(rating, writing, RATING_FIELDS)
                 self.assertFalse(calibrate(directory, [rating], [skills]))
             self.assertEqual(read_json(directory / "private" / "exit-gate.json")["pov_leaks"], 1)
+
+    def test_resume_sends_only_pending_and_appends_new_review_rows(self):
+        config = copy.deepcopy(self.config)
+        for profile in config["profiles"]:
+            profile["api_key_env"] = None
+        manifest, jobs = plan(config)
+        sample_jobs = [job for job in jobs if job["role"] == "主笔"][:3]
+        output = {"state": "completed", "content": "林夏扬起了手。", "finish_reason": "stop"}
+        with tempfile.TemporaryDirectory() as working:
+            directory = Path(working) / "run"
+            initialize(directory, manifest, sample_jobs)
+            with connect(directory) as db:
+                db.execute("UPDATE calls SET state='completed', result_json=? WHERE call_id=1", (json.dumps(output),))
+                db.execute("UPDATE calls SET state='outcome_unknown' WHERE call_id=2")
+                db.execute("UPDATE calls SET state='paused' WHERE call_id=3")
+            report(directory)
+            with patch("run_benchmark.request_model", return_value=output) as request, contextlib.redirect_stdout(io.StringIO()):
+                self.assertFalse(resume(directory, 5))
+                request.assert_called_once()
+                self.assertEqual(request.call_args.args[2], sample_jobs[2]["prompt"])
+            self.assertEqual([row["state"] for row in load_run(directory)[1]], ["completed", "outcome_unknown", "completed"])
+            template = (directory / "ratings-template.csv").read_text(encoding="utf-8-sig")
+            self.assertIn(sample_jobs[0]["score_id"], template)
+            self.assertNotIn(sample_jobs[1]["score_id"], template)
+            self.assertIn(sample_jobs[2]["score_id"], template)
+
+    def test_prices_can_be_added_without_changing_frozen_record(self):
+        manifest, jobs = plan(self.config)
+        prices = {"input": 2, "output": 5}
+        config = copy.deepcopy(self.config)
+        for profile in config["profiles"]:
+            profile["billing_usd_per_million"] = prices
+        with tempfile.TemporaryDirectory() as working:
+            directory = Path(working) / "run"
+            initialize(directory, manifest, jobs[:1])
+            result = {"state": "completed", "content": "", "prompt_tokens": 50, "completion_tokens": 3, "cost_usd": None}
+            with connect(directory) as db:
+                db.execute("UPDATE calls SET state='completed', result_json=?", (json.dumps(result),))
+            reprice(directory, config)
+            frozen, results = load_run(directory)
+            self.assertEqual(manifest, frozen)
+            self.assertEqual(results[0]["cost_usd"], 0.000115)
+            with connect(directory) as db:
+                self.assertEqual(json.loads(db.execute("SELECT result_json FROM calls").fetchone()[0]), result)
+
+    def test_route_swap_preserves_sent_samples_from_unchanged_route(self):
+        original, jobs = plan(self.config)
+        config = copy.deepcopy(self.config)
+        config["profiles"][0]["model"] = "different-model"
+        manifest, new_jobs = plan(config)
+        with tempfile.TemporaryDirectory() as working:
+            source = Path(working) / "previous"
+            target = Path(working) / "replacement"
+            initialize(source, original, jobs)
+            with connect(source) as db:
+                db.execute("UPDATE calls SET state='paused'")
+                keep = next(i for i, job in enumerate(jobs, 1) if job["profile_id"] == "route-b")
+                discard = next(i for i, job in enumerate(jobs, 1) if job["profile_id"] == "route-a")
+                db.execute("UPDATE calls SET state='outcome_unknown' WHERE call_id IN (?,?)", (keep, discard))
+            self.assertEqual(initialize(target, manifest, new_jobs, source), 1)
+            _, rows = load_run(target)
+            carried = [row for row in rows if "source_call" in row]
+            self.assertEqual(len(carried), 1)
+            self.assertEqual(carried[0]["profile_id"], "route-b")
+            self.assertEqual(carried[0]["state"], "outcome_unknown")
+            self.assertEqual(carried[0]["source_call"]["call_id"], keep)
+            self.assertTrue(all(row["state"] == "queued" for row in rows if row["profile_id"] == "route-a"))
 
 
 if __name__ == "__main__":
