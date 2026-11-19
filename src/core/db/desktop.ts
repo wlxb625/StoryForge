@@ -2,7 +2,7 @@ import { invoke, isTauri } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import type {
   Capabilities, Chapter, GenerationTask, ModelProfile, ProbeResult, ProfileInput, Project, Revision,
-  RevisionInput, TaskEvent, TaskInput,
+  RevisionInput, TaskEvent, TaskInput, Pack, StyleCatalog, Scene, SceneInput, PromptRevision, Trace,
 } from '../contracts/types'
 
 const call = <T>(name: string, args?: Record<string, unknown>) => {
@@ -39,6 +39,16 @@ export const desktop = {
   events: (taskId: string, fromEventSeq: number) => call<TaskEvent[]>('task_events', { taskId, fromEventSeq }),
   start: (taskId: string) => call<boolean>('llm_stream_start', { taskId }),
   cancel: (taskId: string, technicalIssue?: string) => call<boolean>('llm_stream_cancel', { taskId, technicalIssue: technicalIssue ?? null }),
+  catalog: () => call<StyleCatalog>('style_catalog'),
+  writePacks: (packs: Pack[], seed = false) => call<StyleCatalog>('write_style_packs', { packs, seed }),
+  enablePack: (itemId: string, enabled: boolean) => call<StyleCatalog>('enable_style_pack', { itemId, enabled }),
+  chooseStyle: (base: string | null, cartridge: string | null) => call<StyleCatalog>('choose_style', { base, cartridge }),
+  scenes: () => call<Scene[]>('list_scenes'),
+  saveScene: (input: SceneInput) => call<Scene>('save_scene', { input }),
+  linkScene: (chapterId: string, sceneId: string | null) => call<void>('link_scene', { chapterId, sceneId }),
+  prompts: () => call<PromptRevision[]>('prompt_revisions'),
+  savePrompt: (instruction: string) => call<PromptRevision>('save_prompt_revision', { instruction }),
+  traces: () => call<Trace[]>('list_llm_traces'),
   listen: (onEvent: (event: TaskEvent) => void) =>
     listen<TaskEvent>('storyforge-task', ({ payload }) => onEvent(payload)),
 }

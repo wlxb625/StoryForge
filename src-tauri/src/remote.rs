@@ -118,6 +118,12 @@ impl Remote {
 
 fn update_metering(value: &Value, metering: &mut Metering) {
     let usage = &value["usage"];
+    if let Some(cost) = usage["cost_usd"]
+        .as_f64()
+        .filter(|cost| cost.is_finite() && *cost >= 0.0)
+    {
+        metering.cost_usd = Some(cost);
+    }
     let count = |value: &Value| value.as_i64().filter(|number| *number >= 0);
     if let Some(n) = count(&usage["prompt_tokens"]) {
         metering.prompt_tokens = Some(n);
@@ -369,6 +375,7 @@ mod tests {
                 direct: true,
                 token_limit_field: "max_tokens".into(),
                 capabilities: Capabilities::default(),
+                rates: None,
             },
             worker,
         )

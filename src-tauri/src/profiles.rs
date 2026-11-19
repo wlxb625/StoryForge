@@ -34,6 +34,8 @@ pub struct Profile {
     pub direct: bool,
     pub token_limit_field: String,
     pub capabilities: Capabilities,
+    #[serde(default)]
+    pub rates: Option<Rates>,
 }
 
 #[derive(Serialize)]
@@ -54,6 +56,16 @@ pub struct ProfileInput {
     pub needs_key: bool,
     pub direct: bool,
     pub token_limit_field: String,
+    pub rates: Option<Rates>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Rates {
+    pub input: f64,
+    pub output: f64,
+    pub cache_read: Option<f64>,
+    pub cache_write: Option<f64>,
 }
 
 pub struct ProfileStore {
@@ -141,6 +153,20 @@ impl ProfileStore {
             return Err(StudioError::new(400, "请选择输出上限参数"));
         }
         let endpoint = completion_url(&input.base_url)?;
+        if let Some(rates) = &input.rates {
+            if [
+                Some(rates.input),
+                Some(rates.output),
+                rates.cache_read,
+                rates.cache_write,
+            ]
+            .into_iter()
+            .flatten()
+            .any(|rate| !rate.is_finite() || rate < 0.0)
+            {
+                return Err(StudioError::new(400, "模型费率须为非负数字"));
+            }
+        }
         let mut profiles = self.load()?;
         let index = if let Some(id) = input.id {
             Some(
@@ -178,6 +204,7 @@ impl ProfileStore {
             needs_key: input.needs_key,
             direct: input.direct,
             capabilities: Capabilities::default(),
+            rates: input.rates,
         };
         if let Some(index) = index {
             profiles[index] = profile.clone();
@@ -339,6 +366,7 @@ mod tests {
                 needs_key: true,
                 direct: true,
                 token_limit_field: "max_tokens".into(),
+                rates: None,
             })
             .unwrap();
         assert!(!store.list().unwrap()[0].has_key);

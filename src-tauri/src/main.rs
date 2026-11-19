@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod catalog_commands;
 mod db;
 mod error;
 mod profiles;
@@ -465,6 +466,16 @@ fn main() {
             }
         })
         .invoke_handler(tauri::generate_handler![
+            catalog_commands::style_catalog,
+            catalog_commands::write_style_packs,
+            catalog_commands::enable_style_pack,
+            catalog_commands::choose_style,
+            catalog_commands::list_scenes,
+            catalog_commands::save_scene,
+            catalog_commands::link_scene,
+            catalog_commands::prompt_revisions,
+            catalog_commands::save_prompt_revision,
+            catalog_commands::list_llm_traces,
             new_project,
             open_project,
             rename_project,

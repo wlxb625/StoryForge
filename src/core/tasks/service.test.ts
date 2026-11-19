@@ -14,7 +14,7 @@ function fixture() {
   }
   const task: GenerationTask = {
     taskId: 'task', chapterId: input.chapterId, baseRevisionId: input.baseRevisionId,
-    frozenContext: input.frozenContext, partialOutput: '', lastEventSeq: 1, state: 'queued',
+    frozenContext: input.frozenContext, partialOutput: '', lastEventSeq: 1, state: 'queued', taskType: 'beat_write',
   }
   return { input, task }
 }

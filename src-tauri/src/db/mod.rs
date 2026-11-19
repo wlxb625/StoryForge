@@ -15,8 +15,10 @@ use uuid::Uuid;
 
 use crate::error::{Result, StudioError};
 
+pub mod catalog;
+
 pub const SCHEMA: &str = include_str!("schema.sql");
-const TASK_COLUMNS: &str = "task_id, chapter_id, base_revision_id, state, frozen_context_json, partial_output, last_event_seq";
+const TASK_COLUMNS: &str = "task_id, chapter_id, base_revision_id, state, frozen_context_json, partial_output, last_event_seq, task_type";
 
 pub fn now() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
@@ -52,6 +54,7 @@ pub struct Chapter {
     pub chapter_order: i64,
     pub current_revision_id: Option<String>,
     pub status: String,
+    pub active_scene_id: Option<String>,
 }
 
 fn read_chapter(row: &Row<'_>) -> rusqlite::Result<Chapter> {
@@ -61,6 +64,7 @@ fn read_chapter(row: &Row<'_>) -> rusqlite::Result<Chapter> {
         chapter_order: row.get(2)?,
         current_revision_id: row.get(3)?,
         status: row.get(4)?,
+        active_scene_id: row.get(5)?,
     })
 }
 
@@ -108,6 +112,7 @@ pub struct Task {
     pub frozen_context: Value,
     pub partial_output: String,
     pub last_event_seq: i64,
+    pub task_type: String,
 }
 
 fn read_task(row: &Row<'_>) -> rusqlite::Result<Task> {
@@ -123,6 +128,7 @@ fn read_task(row: &Row<'_>) -> rusqlite::Result<Task> {
         frozen_context,
         partial_output: row.get(5)?,
         last_event_seq: row.get(6)?,
+        task_type: row.get(7)?,
     })
 }
 
@@ -150,6 +156,7 @@ pub struct Metering {
     pub prompt_tokens: Option<i64>,
     pub completion_tokens: Option<i64>,
     pub cached_tokens: Option<i64>,
+    pub cost_usd: Option<f64>,
     pub latency_ms: i64,
     pub profile_id: String,
 }
@@ -207,7 +214,7 @@ impl Project {
         Self::from_connection(conn, path)
     }
 
-    fn from_connection(conn: Connection, path: PathBuf) -> Result<Self> {
+    fn from_connection(mut conn: Connection, path: PathBuf) -> Result<Self> {
         conn.busy_timeout(Duration::from_secs(5))?;
         let version: i64 = conn
             .query_row(
@@ -216,12 +223,24 @@ impl Project {
                 |row| row.get(0),
             )
             .map_err(|_| StudioError::new(400, "这个文件不是有效的 StoryForge 工程"))?;
-        if version != 1 {
+        if !matches!(version, 1 | 2) {
             return Err(StudioError::new(409, "工程版本与当前应用不兼容"));
         }
         conn.execute_batch(
             "PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;",
         )?;
+        if version == 1 {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let current: i64 =
+                tx.query_row("SELECT schema_version FROM project_meta LIMIT 1", [], |r| {
+                    r.get(0)
+                })?;
+            if current == 1 {
+                tx.execute_batch(include_str!("002_creation.sql"))?;
+                tx.execute("UPDATE project_meta SET schema_version=2", [])?;
+            }
+            tx.commit()?;
+        }
         let info = conn.query_row("SELECT project_id,title,target_beat_chars,target_chapter_chars FROM project_meta LIMIT 1", [], |r| {
             Ok(ProjectInfo { project_id: r.get(0)?, title: r.get(1)?, path: path.to_string_lossy().into(),
                 target_beat_chars: r.get(2)?, target_chapter_chars: r.get(3)? })
@@ -231,7 +250,7 @@ impl Project {
 
     pub fn chapters(&self) -> Result<Vec<Chapter>> {
         let mut query = self.conn.prepare(
-            "SELECT chapter_id,title,chapter_order,current_revision_id,status FROM chapters
+            "SELECT chapter_id,title,chapter_order,current_revision_id,status,active_scene_id FROM chapters
             WHERE status!='archived' ORDER BY chapter_order, chapter_id",
         )?;
         let rows = query
@@ -242,7 +261,7 @@ impl Project {
 
     pub fn archived_chapters(&self) -> Result<Vec<Chapter>> {
         let mut query = self.conn.prepare(
-            "SELECT chapter_id,title,chapter_order,current_revision_id,status FROM chapters
+            "SELECT chapter_id,title,chapter_order,current_revision_id,status,active_scene_id FROM chapters
             WHERE status='archived' ORDER BY updated_at DESC",
         )?;
         let rows = query
@@ -304,6 +323,7 @@ impl Project {
             chapter_order: position,
             current_revision_id: None,
             status: "planned".into(),
+            active_scene_id: None,
         })
     }
 
@@ -418,7 +438,10 @@ impl Project {
                     .as_deref()
                     .ok_or_else(|| StudioError::new(400, "缺少生成任务"))?;
                 let task = find_task(&tx, task_id)?;
-                if task.chapter_id != input.chapter_id || task.base_revision_id != base {
+                if !matches!(task.task_type.as_str(), "beat_write" | "ab_write")
+                    || task.chapter_id != input.chapter_id
+                    || task.base_revision_id != base
+                {
                     return Err(StudioError::new(
                         409,
                         "这份草稿的基线已过期，仍可从任务历史复制正文",
@@ -484,7 +507,10 @@ impl Project {
     pub fn create_task(&mut self, input: TaskInput) -> Result<Task> {
         if input.idempotency_key.is_empty()
             || input.idempotency_key.len() > 128
-            || input.task_type != "beat_write"
+            || !matches!(
+                input.task_type.as_str(),
+                "beat_write" | "ab_write" | "skill_extract"
+            )
         {
             return Err(StudioError::new(400, "无效的节拍生成请求"));
         }
@@ -645,8 +671,8 @@ impl Project {
         )?;
         if let Some(usage) = usage {
             tx.execute("INSERT INTO llm_traces(trace_id,task_id,model_profile_id,stage,prompt_tokens,cached_tokens,completion_tokens,cost_usd,latency_ms,status,created_at)
-                VALUES (?1,?2,?3,'beat_write',?4,?5,?6,NULL,?7,?8,?9)",
-                params![id(), task_id, usage.profile_id, usage.prompt_tokens, usage.cached_tokens, usage.completion_tokens, usage.latency_ms, state, now()])?;
+                VALUES (?1,?2,?3,(SELECT task_type FROM generation_tasks WHERE task_id=?2),?4,?5,?6,?7,?8,?9,?10)",
+                params![id(), task_id, usage.profile_id, usage.prompt_tokens, usage.cached_tokens, usage.completion_tokens, usage.cost_usd, usage.latency_ms, state, now()])?;
         }
         tx.commit()?;
         Ok(Some(event))
@@ -790,10 +816,55 @@ mod tests {
     }
 
     #[test]
+    fn schema_two_retains_existing_chapter_and_links_a_shared_scene() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("升级.story");
+        let original = Connection::open(&path).unwrap();
+        original.execute_batch(SCHEMA).unwrap();
+        original.execute("INSERT INTO project_meta(project_id,title,created_at,updated_at) VALUES('old','旧书',?1,?1)", [now()]).unwrap();
+        original.execute("INSERT INTO chapters(chapter_id,chapter_order,title,created_at,updated_at) VALUES('original',1,'原章',?1,?1)", [now()]).unwrap();
+        drop(original);
+        let mut upgraded = Project::open(path).unwrap();
+        let second = upgraded.insert_chapter("第二章", None).unwrap();
+        let scene = upgraded
+            .save_scene(catalog::SceneInput {
+                scene_id: None,
+                version: None,
+                title: "跨章同场".into(),
+                details: json!({"location":"渡口"}),
+            })
+            .unwrap();
+        upgraded
+            .link_scene("original", Some(&scene.scene_id))
+            .unwrap();
+        upgraded
+            .link_scene(&second.chapter_id, Some(&scene.scene_id))
+            .unwrap();
+        assert!(upgraded
+            .chapters()
+            .unwrap()
+            .iter()
+            .all(|c| c.active_scene_id.as_ref() == Some(&scene.scene_id)));
+        assert_eq!(
+            upgraded
+                .save_scene(catalog::SceneInput {
+                    scene_id: Some(scene.scene_id),
+                    version: Some(0),
+                    title: "并发失效".into(),
+                    details: json!({})
+                })
+                .err()
+                .unwrap()
+                .status,
+            409
+        );
+    }
+
+    #[test]
     fn story_schema_wal_and_chapter_ids_survive_editing_order() {
         let (_temp, mut project, first) = project();
         let table_count: i64 = project.conn.query_row("SELECT count(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'chapters_fts_%'", [], |r| r.get(0)).unwrap();
-        assert_eq!(table_count, 13);
+        assert_eq!(table_count, 15);
         assert_eq!(
             project
                 .conn

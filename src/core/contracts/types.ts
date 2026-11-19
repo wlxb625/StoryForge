@@ -25,11 +25,15 @@ export interface ModelProfile {
   direct: boolean
   tokenLimitField: 'max_tokens' | 'max_completion_tokens'
   capabilities: Capabilities
+  rates?: Rates | null
 }
 
 export type ProfileInput = Pick<ModelProfile, 'name' | 'model' | 'baseUrl' | 'needsKey' | 'direct' | 'tokenLimitField'> & {
   id?: string
+  rates?: Rates | null
 }
+
+export interface Rates { input: number; output: number; cacheRead?: number | null; cacheWrite?: number | null }
 
 export interface ProbeResult {
   state: TaskState
@@ -55,6 +59,7 @@ export interface Chapter {
   title: string
   currentRevisionId: string | null
   status: string
+  activeSceneId?: string | null
 }
 
 export interface Revision {
@@ -92,21 +97,91 @@ export interface FrozenContext {
   model: string
   prompt: string
   requestBody: Record<string, unknown>
+  scene?: Scene
+  intent?: SceneIntent
+  promptRevisionId?: string | null
+  activeSkills?: Array<{ id: string; name: string; version: string }>
+  comparison?: { id: string; label: 'A' | 'B' }
+  rates?: Rates | null
 }
 
 export interface TaskInput {
   idempotencyKey: string
   chapterId: string
   baseRevisionId: string | null
-  taskType: 'beat_write'
+  taskType: 'beat_write' | 'ab_write' | 'skill_extract'
   frozenContext: FrozenContext
 }
 
-export interface GenerationTask extends Omit<TaskInput, 'idempotencyKey' | 'taskType'> {
+export interface GenerationTask extends Omit<TaskInput, 'idempotencyKey'> {
   taskId: string
   state: TaskState
   partialOutput: string
   lastEventSeq: number
+}
+
+export type SkillAxis = 'narrative' | 'character' | 'emotion' | 'dialogue' | 'humor' | 'pacing'
+
+export interface Pack {
+  itemId: string
+  itemKind: 'writing_skill' | 'genre_cartridge'
+  slot: 'base_style' | 'technique' | 'cartridge'
+  name: string
+  version: string
+  priority: number
+  metadata: {
+    axis?: SkillAxis
+    triggers?: string[]
+    antiTriggers?: string[]
+    avoidPhrases?: string[]
+    description?: string
+    stages?: string[]
+    preferredSkills?: string[]
+  }
+  body: string
+  enabled: boolean
+}
+
+export interface StyleCatalog {
+  packs: Pack[]
+  activeBaseSkillId: string | null
+  activePackId: string | null
+}
+
+export interface SceneIntent {
+  goal: string
+  hiddenGoal: string
+  action: string
+  emotion: string
+  dialogue: string
+  pace: string
+  humor: '允许' | '克制' | '禁止'
+  pov: string
+}
+
+export interface SceneDetails {
+  time: string
+  location: string
+  cast: string
+  conflict: string
+  intent?: Partial<SceneIntent>
+  techniqueIds?: string[]
+}
+export interface Scene { sceneId: string; title: string; version: number; details: SceneDetails }
+export type SceneInput = Partial<Pick<Scene, 'sceneId' | 'version'>> & Pick<Scene, 'title' | 'details'>
+export interface PromptRevision { promptRevisionId: string; instruction: string; createdAt: string }
+export interface Trace {
+  traceId: string
+  taskId: string
+  modelProfileId: string
+  stage: string
+  promptTokens: number | null
+  cachedTokens: number | null
+  completionTokens: number | null
+  costUsd: number | null
+  latencyMs: number
+  status: string
+  createdAt: string
 }
 
 export interface TaskEvent {

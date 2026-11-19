@@ -1,11 +1,14 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { isTauri } from '@tauri-apps/api/core'
 import {
   ArrowDown, ArrowLeft, ArrowRight, ArrowUp, BookOpen, ChevronDown, CircleAlert,
-  Clock3, Copy, FilePlus2, FolderOpen, PanelRight, Plus, Settings2, Sparkles, Square, X,
+  Beaker, Clock3, Copy, FilePlus2, FolderOpen, Library, PanelRight, PenLine, Plus, Settings2, Sparkles, Square, X,
 } from 'lucide-vue-next'
 import ModelSettings from './components/ModelSettings.vue'
+import SceneControls from './components/SceneControls.vue'
+import PacksView from './views/PacksView.vue'
+import LabView from './views/LabView.vue'
 import { activeTask, type GenerationTask, type TaskState } from './core/contracts/types'
 import { countHan } from './core/quality/hardGate'
 import { useStudio } from './stores/studio'
@@ -18,6 +21,8 @@ const chapterForm = ref(false)
 const newChapterTitle = ref('')
 const panel = ref<'draft' | 'history'>('draft')
 const showInspector = ref(true)
+const view = ref<'studio' | 'packs' | 'lab'>('studio')
+watch(() => studio.project?.projectId, () => { view.value = 'studio' })
 const chapterProgress = computed(() => {
   const target = studio.project?.targetChapterChars ?? 2000
   return Math.min(100, Math.round(studio.currentCount / target * 100))
@@ -103,10 +108,15 @@ async function copyDraft(task: GenerationTask) {
         <button type="button" class="book-name flat-button" title="修改书名" @click="renameBook">{{ studio.project.title }} <ChevronDown :size="13" /></button>
         <span v-if="studio.queuedCount" class="queue-indicator"><span></span>{{ studio.queuedCount }} 项生成任务</span>
       </div>
+      <nav v-if="studio.project" class="workspace-nav" aria-label="工作台导航">
+        <button class="flat-button" :class="{ selected: view === 'studio' }" type="button" aria-label="写作台" @click="view = 'studio'"><PenLine :size="16" /><span>写作台</span></button>
+        <button class="flat-button" :class="{ selected: view === 'packs' }" type="button" aria-label="卡带与配方" @click="view = 'packs'"><Library :size="16" /><span>配方</span></button>
+        <button class="flat-button" :class="{ selected: view === 'lab' }" type="button" aria-label="实验室" @click="view = 'lab'"><Beaker :size="16" /><span>实验室</span></button>
+      </nav>
       <div class="header-actions">
         <button v-if="studio.project" type="button" class="flat-button desktop-only" :disabled="studio.busy" @click="studio.openWorkspace()"><FolderOpen :size="16" /> 打开工程</button>
         <button type="button" class="flat-button" aria-label="模型设置" @click="model"><Settings2 :size="17" /><span>{{ studio.selectedProfile?.name ?? '模型设置' }}</span></button>
-        <button v-if="studio.project" class="icon-button" type="button" :aria-pressed="showInspector" aria-label="切换右侧面板" @click="showInspector = !showInspector"><PanelRight :size="18" /></button>
+        <button v-if="studio.project && view === 'studio'" class="icon-button" type="button" :aria-pressed="showInspector" aria-label="切换右侧面板" @click="showInspector = !showInspector"><PanelRight :size="18" /></button>
       </div>
     </header>
 
@@ -132,6 +142,8 @@ async function copyDraft(task: GenerationTask) {
       </div>
     </main>
 
+    <PacksView v-else-if="view === 'packs'" />
+    <LabView v-else-if="view === 'lab'" />
     <main v-else class="studio-layout" :class="{ compact: !showInspector }">
       <aside class="chapter-pane" aria-label="章节目录">
         <div class="aside-head"><strong>章节</strong><button type="button" class="icon-button" aria-label="添加章节" @click="chapterForm = !chapterForm"><Plus :size="18" /></button></div>
@@ -201,6 +213,7 @@ async function copyDraft(task: GenerationTask) {
             </select>
             <button v-else type="button" class="flat-button" @click="model">配置模型</button>
           </div>
+          <SceneControls />
           <div v-if="studio.currentTask" class="task-card">
             <div class="task-meta"><span class="state-label" :class="{ amber: recovered }">{{ states[studio.currentTask.state] }}</span>
               <span>{{ countHan(studio.currentTask.partialOutput) }} 字</span></div>

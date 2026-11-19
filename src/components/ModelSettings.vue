@@ -12,6 +12,7 @@ const form = reactive<ProfileInput>({
   name: '', model: '', baseUrl: '', needsKey: true, direct: false, tokenLimitField: 'max_tokens',
 })
 const pending = ref(false)
+const rates = reactive({ input: '', output: '', cacheRead: '', cacheWrite: '' })
 const warning = ref('')
 const active = computed(() => studio.profiles.find((profile) => profile.id === form.id))
 const labels = {
@@ -28,6 +29,10 @@ function choose(profile?: ModelProfile) {
     id: profile.id, name: profile.name, model: profile.model, baseUrl: profile.baseUrl, needsKey: profile.needsKey,
     direct: profile.direct, tokenLimitField: profile.tokenLimitField,
   } : { id: undefined, name: '', model: '', baseUrl: '', needsKey: true, direct: false, tokenLimitField: 'max_tokens' })
+  for (const key of Object.keys(rates) as Array<keyof typeof rates>) {
+    const value = profile?.rates?.[key]
+    rates[key] = value == null ? '' : String(value)
+  }
 }
 choose(studio.selectedProfile ?? studio.profiles[0])
 
@@ -41,9 +46,13 @@ async function act(operation: () => Promise<void>) {
 
 function save() {
   return act(async () => {
+    const hasRates = Object.values(rates).some(value => !!value.trim())
+    if (hasRates && (!rates.input.trim() || !rates.output.trim())) throw new Error('填写计费信息时，输入和输出单价均为必填。')
     const saved = await desktop.saveProfile({
       id: form.id, name: form.name, model: form.model, baseUrl: form.baseUrl,
       needsKey: form.needsKey, direct: form.direct, tokenLimitField: form.tokenLimitField,
+      rates: hasRates ? { input: Number(rates.input), output: Number(rates.output),
+        cacheRead: rates.cacheRead.trim() ? Number(rates.cacheRead) : null, cacheWrite: rates.cacheWrite.trim() ? Number(rates.cacheWrite) : null } : null,
     })
     await studio.readProfiles()
     studio.profileId = saved.id
@@ -110,6 +119,13 @@ function probe() {
               <option value="max_completion_tokens">max_completion_tokens</option>
             </select>
           </label>
+          <details class="rate-inputs">
+            <summary>计费单价（美元／百万 token）</summary>
+            <label>输入<input v-model="rates.input" type="text" inputmode="decimal"></label>
+            <label>输出<input v-model="rates.output" type="text" inputmode="decimal"></label>
+            <label>缓存读<input v-model="rates.cacheRead" type="text" inputmode="decimal"></label>
+            <label>缓存写<input v-model="rates.cacheWrite" type="text" inputmode="decimal"></label>
+          </details>
           <div class="model-actions">
             <button class="primary-button" type="submit" :disabled="pending">保存档案</button>
             <button v-if="active?.needsKey" class="secondary-button" type="button" :disabled="pending" @click="credential">

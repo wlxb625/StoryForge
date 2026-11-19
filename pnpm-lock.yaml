@@ -20,16 +20,19 @@ importers:
       vue:
         specifier: ^3.5.25
         version: 3.5.45(typescript@5.9.3)
+      yaml:
+        specifier: ^2.9.1
+        version: 2.9.1
     devDependencies:
       '@tailwindcss/vite':
         specifier: ^4.1.17
-        version: 4.3.5(vite@7.3.8(jiti@2.7.0)(lightningcss@1.33.0))
+        version: 4.3.5(vite@7.3.8(jiti@2.7.0)(lightningcss@1.33.0)(yaml@2.9.1))
       '@tauri-apps/cli':
         specifier: ^2.9.6
         version: 2.12.5
       '@vitejs/plugin-vue':
         specifier: ^6.0.2
-        version: 6.0.11(vite@7.3.8(jiti@2.7.0)(lightningcss@1.33.0))(vue@3.5.45(typescript@5.9.3))
+        version: 6.0.11(vite@7.3.8(jiti@2.7.0)(lightningcss@1.33.0)(yaml@2.9.1))(vue@3.5.45(typescript@5.9.3))
       tailwindcss:
         specifier: ^4.1.17
         version: 4.3.5
@@ -38,10 +41,10 @@ importers:
         version: 5.9.3
       vite:
         specifier: ^7.2.2
-        version: 7.3.8(jiti@2.7.0)(lightningcss@1.33.0)
+        version: 7.3.8(jiti@2.7.0)(lightningcss@1.33.0)(yaml@2.9.1)
       vitest:
         specifier: ^4.0.9
-        version: 4.1.12(vite@7.3.8(jiti@2.7.0)(lightningcss@1.33.0))
+        version: 4.1.12(vite@7.3.8(jiti@2.7.0)(lightningcss@1.33.0)(yaml@2.9.1))
       vue-tsc:
         specifier: ^3.1.3
         version: 3.3.14(typescript@5.9.3)
@@ -1044,6 +1047,11 @@ packages:
     engines: {node: '>=8'}
     hasBin: true
 
+  yaml@2.9.1:
+    resolution: {integrity: sha512-3NxN8+78OdzbT7C/WjGsyfPAtJaN3FNDsWxv7Y7mcDsT/oOmgW8BpyQQFFBnvZE3j9Y2Sdz1ULFLezL7Eb2yFw==}
+    engines: {node: '>= 14.6'}
+    hasBin: true
+
 snapshots:
 
   '@babel/helper-string-parser@7.29.14': {}
@@ -1299,12 +1307,12 @@ snapshots:
       '@tailwindcss/oxide-win32-arm64-msvc': 4.3.5
       '@tailwindcss/oxide-win32-x64-msvc': 4.3.5
 
-  '@tailwindcss/vite@4.3.5(vite@7.3.8(jiti@2.7.0)(lightningcss@1.33.0))':
+  '@tailwindcss/vite@4.3.5(vite@7.3.8(jiti@2.7.0)(lightningcss@1.33.0)(yaml@2.9.1))':
     dependencies:
       '@tailwindcss/node': 4.3.5
       '@tailwindcss/oxide': 4.3.5
       tailwindcss: 4.3.5
-      vite: 7.3.8(jiti@2.7.0)(lightningcss@1.33.0)
+      vite: 7.3.8(jiti@2.7.0)(lightningcss@1.33.0)(yaml@2.9.1)
 
   '@tauri-apps/api@2.12.5': {}
 
@@ -1364,10 +1372,10 @@ snapshots:
 
   '@types/estree@1.0.10': {}
 
-  '@vitejs/plugin-vue@6.0.11(vite@7.3.8(jiti@2.7.0)(lightningcss@1.33.0))(vue@3.5.45(typescript@5.9.3))':
+  '@vitejs/plugin-vue@6.0.11(vite@7.3.8(jiti@2.7.0)(lightningcss@1.33.0)(yaml@2.9.1))(vue@3.5.45(typescript@5.9.3))':
     dependencies:
       '@rolldown/pluginutils': 1.1.1
-      vite: 7.3.8(jiti@2.7.0)(lightningcss@1.33.0)
+      vite: 7.3.8(jiti@2.7.0)(lightningcss@1.33.0)(yaml@2.9.1)
       vue: 3.5.45(typescript@5.9.3)
 
   '@vitest/expect@4.1.12':
@@ -1379,13 +1387,13 @@ snapshots:
       chai: 6.3.0
       tinyrainbow: 3.2.0
 
-  '@vitest/mocker@4.1.12(vite@7.3.8(jiti@2.7.0)(lightningcss@1.33.0))':
+  '@vitest/mocker@4.1.12(vite@7.3.8(jiti@2.7.0)(lightningcss@1.33.0)(yaml@2.9.1))':
     dependencies:
       '@vitest/spy': 4.1.12
       estree-walker: 3.0.3
       magic-string: 0.30.21
     optionalDependencies:
-      vite: 7.3.8(jiti@2.7.0)(lightningcss@1.33.0)
+      vite: 7.3.8(jiti@2.7.0)(lightningcss@1.33.0)(yaml@2.9.1)
 
   '@vitest/pretty-format@4.1.12':
     dependencies:
@@ -1749,7 +1757,7 @@ snapshots:
 
   typescript@5.9.3: {}
 
-  vite@7.3.8(jiti@2.7.0)(lightningcss@1.33.0):
+  vite@7.3.8(jiti@2.7.0)(lightningcss@1.33.0)(yaml@2.9.1):
     dependencies:
       esbuild: 0.28.2
       fdir: 6.5.0(picomatch@4.0.7)
@@ -1761,11 +1769,12 @@ snapshots:
       fsevents: 2.3.3
       jiti: 2.7.0
       lightningcss: 1.33.0
+      yaml: 2.9.1
 
-  vitest@4.1.12(vite@7.3.8(jiti@2.7.0)(lightningcss@1.33.0)):
+  vitest@4.1.12(vite@7.3.8(jiti@2.7.0)(lightningcss@1.33.0)(yaml@2.9.1)):
     dependencies:
       '@vitest/expect': 4.1.12
-      '@vitest/mocker': 4.1.12(vite@7.3.8(jiti@2.7.0)(lightningcss@1.33.0))
+      '@vitest/mocker': 4.1.12(vite@7.3.8(jiti@2.7.0)(lightningcss@1.33.0)(yaml@2.9.1))
       '@vitest/pretty-format': 4.1.12
       '@vitest/runner': 4.1.12
       '@vitest/snapshot': 4.1.12
@@ -1782,7 +1791,7 @@ snapshots:
       tinyexec: 1.3.1
       tinyglobby: 0.2.17
       tinyrainbow: 3.2.0
-      vite: 7.3.8(jiti@2.7.0)(lightningcss@1.33.0)
+      vite: 7.3.8(jiti@2.7.0)(lightningcss@1.33.0)(yaml@2.9.1)
       why-is-node-running: 2.3.0
     transitivePeerDependencies:
       - msw
@@ -1820,3 +1829,5 @@ snapshots:
     dependencies:
       siginfo: 2.0.0
       stackback: 0.0.2
+
+  yaml@2.9.1: {}

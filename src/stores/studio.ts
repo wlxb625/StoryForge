@@ -2,12 +2,16 @@ import { defineStore } from 'pinia'
 import { computed, ref, watch } from 'vue'
 import {
   activeTask, errorMessage, type Chapter, type GenerationTask, type ModelProfile,
-  type Project, type Revision, type TaskEvent,
+  type Project, type Revision, type TaskEvent, type Pack, type Scene, type SceneInput, type StyleCatalog,
+  type PromptRevision, type Trace, type FrozenContext, type TaskInput,
 } from '../core/contracts/types'
 import { desktop } from '../core/db/desktop'
-import { freezeContext } from '../core/narrative/freeze'
+import { freezeContext, retarget } from '../core/narrative/freeze'
+import { activeStyles, deriveIntent } from '../core/narrative/intent'
 import { countHan, technicalIssue } from '../core/quality/hardGate'
 import { taskService } from '../core/tasks/service'
+import { builtins } from '../core/skills/builtins'
+import { skillExtraction } from '../core/skills/extraction'
 
 export const useStudio = defineStore('studio', () => {
   const project = ref<Project | null>(null)
@@ -26,19 +30,26 @@ export const useStudio = defineStore('studio', () => {
   const notice = ref('')
   const busy = ref(false)
   const writingIssues = ref<Record<string, string>>({})
+  const styles = ref<StyleCatalog>({ packs: [], activeBaseSkillId: null, activePackId: null })
+  const scenes = ref<Scene[]>([])
+  const promptHistory = ref<PromptRevision[]>([])
+  const traces = ref<Trace[]>([])
   const subscriptions = new Map<string, () => void>()
   let bufferTimer: ReturnType<typeof setTimeout> | undefined
   let noticeTimer: ReturnType<typeof setTimeout> | undefined
 
   const chapter = computed(() => chapters.value.find((entry) => entry.chapterId === chapterId.value))
   const selectedProfile = computed(() => profiles.value.find((entry) => entry.id === profileId.value))
-  const chapterTasks = computed(() => tasks.value.filter((entry) => entry.chapterId === chapterId.value))
+  const chapterTasks = computed(() => tasks.value.filter((entry) => entry.chapterId === chapterId.value && entry.taskType === 'beat_write'))
   const currentTask = computed(() => chapterTasks.value.find((entry) => entry.taskId === taskId.value) ?? chapterTasks.value[0])
   const currentActive = computed(() => chapterTasks.value.find((entry) => activeTask(entry.state)))
   const currentCount = computed(() => countHan(text.value))
   const dirty = computed(() => text.value !== acceptedText.value)
   const history = computed(() => revisions.value.filter((revision) => revision.saveKind !== 'auto_buffer'))
   const queuedCount = computed(() => tasks.value.filter((task) => activeTask(task.state)).length)
+  const scene = computed(() => scenes.value.find((item) => item.sceneId === chapter.value?.activeSceneId))
+  const sceneIntent = computed(() => deriveIntent(scene.value, draftHint.value, acceptedText.value))
+  const sceneStyles = computed(() => activeStyles(styles.value, scene.value, sceneIntent.value, draftHint.value))
 
   function flash(message: string) {
     notice.value = message
@@ -80,8 +91,13 @@ export const useStudio = defineStore('studio', () => {
   async function loadWorkspace(result: Project) {
     resetSubscriptions()
     project.value = result
-    await readChapters()
-    tasks.value = await desktop.tasks()
+    const [catalog, savedScenes, prompts, storedTasks] = await Promise.all([
+      desktop.writePacks(builtins, true), desktop.scenes(), desktop.prompts(), desktop.tasks(), readChapters(),
+    ])
+    styles.value = catalog
+    scenes.value = savedScenes
+    promptHistory.value = prompts
+    tasks.value = storedTasks
     writingIssues.value = {}
     for (const task of tasks.value.filter((item) => activeTask(item.state))) watchTask(task)
     await readChapter(chapters.value[0]?.chapterId ?? '')
@@ -232,7 +248,7 @@ export const useStudio = defineStore('studio', () => {
     if (event.payload.text) task.partialOutput += event.payload.text
     if (event.payload.state) task.state = event.payload.state
     if (event.payload.message) writingIssues.value[task.taskId] = event.payload.message
-    if (event.eventType === 'token' || event.eventType === 'completed') {
+    if (task.taskType !== 'skill_extract' && (event.eventType === 'token' || event.eventType === 'completed')) {
       const issue = technicalIssue(task.partialOutput, event.eventType === 'completed', event.payload.finishReason)
       if (issue && !writingIssues.value[task.taskId]) {
         writingIssues.value[task.taskId] = issue
@@ -242,6 +258,7 @@ export const useStudio = defineStore('studio', () => {
     if (!activeTask(task.state) && (task.state !== 'completed' || !writingIssues.value[task.taskId])) {
       subscriptions.get(task.taskId)?.()
       subscriptions.delete(task.taskId)
+      void refreshTraces().catch(() => {})
     }
   }
 
@@ -260,15 +277,97 @@ export const useStudio = defineStore('studio', () => {
     if (currentActive.value) throw new Error('该章已有待处理任务。')
     await saveText()
     const revision = revisions.value.find((item) => item.revisionId === entry.currentRevisionId)
-    const frozenContext = freezeContext(book, entry, revision, profile, instruction, carryDraft)
-    const task = await taskService.createTask({
-      idempotencyKey: crypto.randomUUID(), chapterId: entry.chapterId,
-      baseRevisionId: entry.currentRevisionId, taskType: 'beat_write', frozenContext,
+    const frozenContext = freezeContext(book, entry, revision, profile, instruction, carryDraft, {
+      scene: scene.value, catalog: styles.value, promptRevision: promptHistory.value[0],
     })
-    tasks.value.unshift(task)
+    const task = await makeTask(entry, 'beat_write', frozenContext)
     taskId.value = task.taskId
-    watchTask(task)
     await taskService.startTask(task.taskId)
+  }
+
+  async function makeTask(entry: Chapter, type: TaskInput['taskType'], frozenContext: FrozenContext, key: string = crypto.randomUUID()) {
+    const task = await taskService.createTask({ idempotencyKey: key, chapterId: entry.chapterId,
+      baseRevisionId: entry.currentRevisionId, taskType: type, frozenContext })
+    tasks.value.unshift(task)
+    watchTask(task)
+    return task
+  }
+
+  function setStyle(base: string | null, cartridge: string | null) {
+    return run(async () => { styles.value = await desktop.chooseStyle(base, cartridge) })
+  }
+
+  function togglePack(pack: Pack) {
+    return run(async () => { styles.value = await desktop.enablePack(pack.itemId, !pack.enabled) })
+  }
+
+  function importPacks(packs: Pack[]) {
+    return run(async () => { styles.value = await desktop.writePacks(packs); flash('配方已写入工程') })
+  }
+
+  function saveScene(input: SceneInput) {
+    return run(async () => {
+      const entry = chapter.value
+      if (!entry) throw new Error('请先创建或选择一个章节。')
+      const saved = await desktop.saveScene(input)
+      await desktop.linkScene(entry.chapterId, saved.sceneId)
+      scenes.value = await desktop.scenes()
+      await readChapters()
+      flash('场景已保存')
+    })
+  }
+
+  function selectScene(sceneId: string | null) {
+    return run(async () => {
+      if (!chapter.value) throw new Error('请先创建或选择一个章节。')
+      await desktop.linkScene(chapter.value.chapterId, sceneId)
+      await readChapters()
+    })
+  }
+
+  function savePrompt(instruction: string) {
+    return run(async () => {
+      const revision = await desktop.savePrompt(instruction)
+      promptHistory.value.unshift(revision)
+      flash('已创建提示词新版本')
+    })
+  }
+
+  async function refreshTraces() { traces.value = await desktop.traces() }
+
+  function runSkillExtraction(excerpt: string) {
+    return run(async () => {
+      const entry = chapter.value
+      const profile = selectedProfile.value
+      const book = project.value
+      if (!entry || !book || !profile || (profile.needsKey && !profile.hasKey)) throw new Error('请先选择章节和可用模型。')
+      const count = Array.from(excerpt.trim()).length
+      if (count < 1500 || count > 3000) throw new Error('请粘贴 1500 至 3000 字的样章。')
+      const task = await makeTask(entry, 'skill_extract', skillExtraction(book, entry, profile, excerpt.trim()))
+      await taskService.startTask(task.taskId)
+    })
+  }
+
+  function compareModels(firstId: string, secondId: string, instruction: string) {
+    return run(async () => {
+      const book = project.value
+      const entry = chapter.value
+      const a = profiles.value.find(profile => profile.id === firstId)
+      const b = profiles.value.find(profile => profile.id === secondId)
+      if (!book || !entry || !a || !b || a.id === b.id || [a,b].some(p => p.needsKey && !p.hasKey)) {
+        throw new Error('请选择一个章节和两份可用的不同模型档案。')
+      }
+      await saveText()
+      const source = revisions.value.find(revision => revision.revisionId === entry.currentRevisionId)
+      const ids: ['A' | 'B', 'A' | 'B'] = (crypto.getRandomValues(new Uint8Array(1))[0] ?? 0) % 2 ? ['A', 'B'] : ['B', 'A']
+      const id = crypto.randomUUID()
+      const shared = freezeContext(book, entry, source, a, instruction, '', {
+        scene: scene.value, catalog: styles.value, promptRevision: promptHistory.value[0],
+      })
+      const first = await makeTask(entry, 'ab_write', { ...shared, comparison: { id, label: ids[0] } }, id + ':' + ids[0])
+      const second = await makeTask(entry, 'ab_write', { ...retarget(shared, b), comparison: { id, label: ids[1] } }, id + ':' + ids[1])
+      await Promise.all([taskService.startTask(first.taskId), taskService.startTask(second.taskId)])
+    })
   }
 
   function generate() { return run(() => createAndRun()) }
@@ -326,6 +425,7 @@ export const useStudio = defineStore('studio', () => {
     draftHint, error, notice, busy, dirty, currentCount, tasks, chapterTasks, taskId, currentTask, currentActive,
     queuedCount, writingIssues, initialize, openWorkspace, closeWorkspace, renameWorkspace, readProfiles, openChapter, addChapter,
     renameChapter, moveChapter, archiveSelected, restoreChapter, saveCurrent, restoreRevision, generate, startQueued,
-    cancel, resumeTask, acceptDraft, flash,
+    cancel, resumeTask, acceptDraft, flash, styles, scenes, scene, sceneIntent, sceneStyles, promptHistory, traces,
+    setStyle, togglePack, importPacks, saveScene, selectScene, savePrompt, refreshTraces, runSkillExtraction, compareModels,
   }
 })

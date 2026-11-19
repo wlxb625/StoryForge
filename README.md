@@ -4,7 +4,7 @@
 
 ## 开发进度
 
-Phase 0 的真实模型对照和 Phase 1 的 Windows 写作台已通过验收。样本覆盖和角色选型见 [实测校准](docs/adr-001-phase0-calibration.md)。Windows 运行与测试见 [桌面端验收](docs/phase1-validation.md)。
+Phase 0 的真实模型对照、Phase 1 的 Windows 写作台与 Phase 2 的创作内核已通过验收。样本覆盖和角色选型见 [实测校准](docs/adr-001-phase0-calibration.md)。Windows 运行与测试见 [桌面端验收](docs/phase1-validation.md)。
 
 | 阶段 | 目标 |
 | --- | --- |
