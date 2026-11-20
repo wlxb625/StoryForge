@@ -81,6 +81,7 @@ pub fn search_text(
     studio: State<'_, Studio>,
     phrase: String,
     exact: String,
+    after_order: Option<i64>,
 ) -> Result<Vec<SearchHit>> {
-    studio.project(|project| project.search_text(&phrase, &exact))
+    studio.project(|project| project.search_text(&phrase, &exact, after_order))
 }

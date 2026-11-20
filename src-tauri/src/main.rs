@@ -2,6 +2,7 @@
 
 mod catalog_commands;
 mod db;
+mod editing_commands;
 mod error;
 mod memory_commands;
 mod profiles;
@@ -494,6 +495,12 @@ fn main() {
             memory_commands::stale_indexes,
             memory_commands::index_chapter,
             memory_commands::search_text,
+            editing_commands::list_arcs,
+            editing_commands::write_arc,
+            editing_commands::assign_arc,
+            editing_commands::preview_pivot,
+            editing_commands::apply_pivot,
+            editing_commands::apply_polish,
             new_project,
             open_project,
             rename_project,

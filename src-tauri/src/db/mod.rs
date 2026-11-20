@@ -16,6 +16,7 @@ use uuid::Uuid;
 use crate::error::{Result, StudioError};
 
 pub mod catalog;
+pub mod editing;
 pub mod memory;
 
 pub const SCHEMA: &str = include_str!("schema.sql");
@@ -57,6 +58,7 @@ pub struct Chapter {
     pub status: String,
     pub active_scene_id: Option<String>,
     pub memory_sync_status: String,
+    pub arc_id: Option<String>,
 }
 
 fn read_chapter(row: &Row<'_>) -> rusqlite::Result<Chapter> {
@@ -68,6 +70,7 @@ fn read_chapter(row: &Row<'_>) -> rusqlite::Result<Chapter> {
         status: row.get(4)?,
         active_scene_id: row.get(5)?,
         memory_sync_status: row.get(6)?,
+        arc_id: row.get(7)?,
     })
 }
 
@@ -78,6 +81,8 @@ pub struct Revision {
     pub parent_revision_id: Option<String>,
     pub save_kind: String,
     pub source_tag: String,
+    pub edit_level: String,
+    pub content_hash: String,
     pub content: String,
     pub cjk_char_count: i64,
     pub created_at: String,
@@ -92,6 +97,8 @@ fn read_revision(row: &Row<'_>) -> rusqlite::Result<Revision> {
         content: row.get(4)?,
         cjk_char_count: row.get(5)?,
         created_at: row.get(6)?,
+        edit_level: row.get(7)?,
+        content_hash: row.get(8)?,
     })
 }
 
@@ -103,6 +110,10 @@ pub struct RevisionInput {
     pub content: String,
     pub source: String,
     pub draft_task_id: Option<String>,
+    #[serde(default)]
+    pub edit_level: Option<String>,
+    #[serde(default)]
+    pub canon_confirmed: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -226,13 +237,13 @@ impl Project {
                 |row| row.get(0),
             )
             .map_err(|_| StudioError::new(400, "这个文件不是有效的 StoryForge 工程"))?;
-        if !(1..=3).contains(&version) {
+        if !(1..=4).contains(&version) {
             return Err(StudioError::new(409, "工程版本与当前应用不兼容"));
         }
         conn.execute_batch(
             "PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;",
         )?;
-        if version < 3 {
+        if version < 4 {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let current: i64 =
                 tx.query_row("SELECT schema_version FROM project_meta LIMIT 1", [], |r| {
@@ -246,6 +257,10 @@ impl Project {
                 tx.execute_batch(include_str!("003_memory.sql"))?;
                 tx.execute("UPDATE project_meta SET schema_version=3", [])?;
             }
+            if current < 4 {
+                tx.execute_batch(include_str!("004_editing.sql"))?;
+                tx.execute("UPDATE project_meta SET schema_version=4", [])?;
+            }
             tx.commit()?;
         }
         let info = conn.query_row("SELECT project_id,title,target_beat_chars,target_chapter_chars FROM project_meta LIMIT 1", [], |r| {
@@ -257,7 +272,7 @@ impl Project {
 
     pub fn chapters(&self) -> Result<Vec<Chapter>> {
         let mut query = self.conn.prepare(
-            "SELECT chapter_id,title,chapter_order,current_revision_id,status,active_scene_id,memory_sync_status FROM chapters
+            "SELECT chapter_id,title,chapter_order,current_revision_id,status,active_scene_id,memory_sync_status,arc_id FROM chapters
             WHERE status!='archived' ORDER BY chapter_order, chapter_id",
         )?;
         let rows = query
@@ -268,7 +283,7 @@ impl Project {
 
     pub fn archived_chapters(&self) -> Result<Vec<Chapter>> {
         let mut query = self.conn.prepare(
-            "SELECT chapter_id,title,chapter_order,current_revision_id,status,active_scene_id,memory_sync_status FROM chapters
+            "SELECT chapter_id,title,chapter_order,current_revision_id,status,active_scene_id,memory_sync_status,arc_id FROM chapters
             WHERE status='archived' ORDER BY updated_at DESC",
         )?;
         let rows = query
@@ -332,6 +347,7 @@ impl Project {
             status: "planned".into(),
             active_scene_id: None,
             memory_sync_status: "pending".into(),
+            arc_id: None,
         })
     }
 
@@ -407,7 +423,7 @@ impl Project {
     }
 
     pub fn revisions(&self, chapter_id: &str) -> Result<Vec<Revision>> {
-        let mut query = self.conn.prepare("SELECT revision_id,parent_revision_id,save_kind,source_tag,content,cjk_char_count,created_at
+        let mut query = self.conn.prepare("SELECT revision_id,parent_revision_id,save_kind,source_tag,content,cjk_char_count,created_at,edit_level,content_hash
             FROM chapter_revisions WHERE chapter_id=?1 ORDER BY rowid DESC")?;
         let rows = query
             .query_map([chapter_id], read_revision)?
@@ -431,8 +447,9 @@ impl Project {
         }
         let (save_kind, source_tag, content) = match input.source.as_str() {
             "manual_edit" => ("formal_revision", "manual_edit", input.content),
+            "polish_diff" => ("formal_revision", "polish_diff", input.content),
             "auto_buffer" => {
-                let prior = tx.query_row("SELECT revision_id,parent_revision_id,save_kind,source_tag,content,cjk_char_count,created_at
+                let prior = tx.query_row("SELECT revision_id,parent_revision_id,save_kind,source_tag,content,cjk_char_count,created_at,edit_level,content_hash
                     FROM chapter_revisions WHERE chapter_id=?1 AND parent_revision_id IS ?2 AND save_kind='auto_buffer' ORDER BY rowid DESC LIMIT 1",
                     params![input.chapter_id, base], read_revision).optional()?;
                 if let Some(prior) = prior.filter(|prior| prior.content == input.content) {
@@ -491,26 +508,42 @@ impl Project {
         if content.len() > 8_000_000 {
             return Err(StudioError::new(413, "章节正文超出保存上限"));
         }
+        let edit_level = if matches!(source_tag, "manual_edit" | "polish_diff")
+            && save_kind == "formal_revision"
+        {
+            editing::resolve_level(
+                &tx,
+                base.as_deref(),
+                &content,
+                input.edit_level.as_deref(),
+                input.canon_confirmed,
+            )?
+        } else {
+            "semantic"
+        };
         let revision = Revision {
             revision_id: id(),
             parent_revision_id: base,
             save_kind: save_kind.into(),
             source_tag: source_tag.into(),
             cjk_char_count: han_count(&content) as i64,
+            content_hash: hash(&content),
+            edit_level: edit_level.into(),
             content,
             created_at: now(),
         };
-        tx.execute("INSERT INTO chapter_revisions(revision_id,chapter_id,parent_revision_id,save_kind,source_tag,content,content_hash,cjk_char_count,created_at)
-            VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+        tx.execute("INSERT INTO chapter_revisions(revision_id,chapter_id,parent_revision_id,save_kind,source_tag,content,content_hash,cjk_char_count,created_at,edit_level)
+            VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
             params![revision.revision_id, input.chapter_id, revision.parent_revision_id, revision.save_kind, revision.source_tag,
-                revision.content, hash(&revision.content), revision.cjk_char_count, revision.created_at])?;
+                revision.content, revision.content_hash, revision.cjk_char_count, revision.created_at,revision.edit_level])?;
         if save_kind == "formal_revision" {
-            if source_tag == "ai_gen" {
-                tx.execute("UPDATE story_events SET active_revision_id=?1 WHERE active_revision_id=?2 AND event_type!='chapter_summary'",
-                    params![revision.revision_id,revision.parent_revision_id])?;
+            if let Some(parent) = revision.parent_revision_id.as_deref() {
+                editing::relink_evidence(&tx, parent, &revision, source_tag == "ai_gen")?;
             }
-            tx.execute("UPDATE chapters SET current_revision_id=?1,status='accepted',memory_sync_status='pending',updated_at=?2 WHERE chapter_id=?3",
-                params![revision.revision_id, revision.created_at, input.chapter_id])?;
+            tx.execute("UPDATE chapters SET current_revision_id=?1,status='accepted',
+                memory_sync_status=CASE WHEN ?4='surface' AND memory_sync_status!='processing' THEN memory_sync_status ELSE 'pending' END,
+                updated_at=?2 WHERE chapter_id=?3",
+                params![revision.revision_id, revision.created_at, input.chapter_id,revision.edit_level])?;
         }
         tx.commit()?;
         Ok(revision)
@@ -526,6 +559,8 @@ impl Project {
                     | "skill_extract"
                     | "memory_extract"
                     | "consistency_check"
+                    | "polish_span"
+                    | "critic"
             )
         {
             return Err(StudioError::new(400, "无效的节拍生成请求"));
@@ -828,6 +863,8 @@ mod tests {
             content: content.into(),
             source: source.into(),
             draft_task_id: None,
+            edit_level: None,
+            canon_confirmed: false,
         }
     }
 
@@ -880,7 +917,7 @@ mod tests {
     fn story_schema_wal_and_chapter_ids_survive_editing_order() {
         let (_temp, mut project, first) = project();
         let table_count: i64 = project.conn.query_row("SELECT count(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'chapters_fts_%'", [], |r| r.get(0)).unwrap();
-        assert_eq!(table_count, 16);
+        assert_eq!(table_count, 17);
         assert_eq!(
             project
                 .conn

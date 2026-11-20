@@ -1,3 +1,5 @@
+import type { EditLevel, EditSpan } from '../narrative/editing'
+
 export type TaskState =
   | 'created' | 'queued' | 'running' | 'streaming' | 'completed'
   | 'failed' | 'cancelled' | 'interrupted' | 'outcome_unknown'
@@ -61,6 +63,7 @@ export interface Chapter {
   status: string
   activeSceneId?: string | null
   memorySyncStatus?: 'pending' | 'processing' | 'synced' | 'needs_confirm'
+  arcId?: string | null
 }
 
 export interface Revision {
@@ -71,6 +74,8 @@ export interface Revision {
   content: string
   cjkCharCount: number
   createdAt: string
+  editLevel?: EditLevel
+  contentHash?: string
 }
 
 export interface RevisionInput {
@@ -79,6 +84,8 @@ export interface RevisionInput {
   content: string
   source: 'manual_edit' | 'ai_gen' | 'interrupted_draft' | 'auto_buffer'
   draftTaskId?: string
+  editLevel?: EditLevel
+  canonConfirmed?: boolean
 }
 
 export interface FrozenContext {
@@ -105,13 +112,14 @@ export interface FrozenContext {
   activeSkills?: Array<{ id: string; name: string; version: string }>
   comparison?: { id: string; label: 'A' | 'B' }
   rates?: Rates | null
+  span?: EditSpan
 }
 
 export interface TaskInput {
   idempotencyKey: string
   chapterId: string
   baseRevisionId: string | null
-  taskType: 'beat_write' | 'ab_write' | 'skill_extract' | 'memory_extract' | 'consistency_check'
+  taskType: 'beat_write' | 'ab_write' | 'skill_extract' | 'memory_extract' | 'consistency_check' | 'polish_span' | 'critic'
   frozenContext: FrozenContext
 }
 

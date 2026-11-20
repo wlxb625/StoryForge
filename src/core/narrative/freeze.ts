@@ -8,6 +8,7 @@ export interface CreativeSources {
   promptRevision?: PromptRevision
   memory?: Memory
   memoryMatches?: string[]
+  direction?: string
 }
 
 export function freezeContext(
@@ -40,6 +41,7 @@ export function freezeContext(
     !memory.guarded && sources?.promptRevision?.instruction ? '作者提示词覆写：' + sources.promptRevision.instruction : '',
     `戏剧目的：${intent.goal}${intent.hiddenGoal ? '。潜在目的：' + intent.hiddenGoal : ''}\n表层行动：${intent.action}\n内在情绪：${intent.emotion}\n交流状态：${intent.dialogue}\n节奏：${intent.pace}\n幽默许可：${intent.humor}`,
     memory.context,
+    sources?.direction ? memory.safe(sources.direction) : '',
     cartridge ? memory.safe(`题材骨架：${cartridge.name} · ${cartridge.body}\n路标：${cartridge.metadata.stages?.join(' / ') ?? ''}`) : '',
     priorText ? `已确认正文末尾：\n${Array.from(priorText).slice(-6000).join('')}` : '',
     !memory.guarded && carryDraft ? `作者选择从这段草稿末尾接续。不要重写这段草稿：\n${Array.from(carryDraft).slice(-6000).join('')}` : '',

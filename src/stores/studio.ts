@@ -14,7 +14,9 @@ import { builtins } from '../core/skills/builtins'
 import { skillExtraction } from '../core/skills/extraction'
 import { cjkIndex, cjkQuery } from '../core/db/fts'
 import { auditFindings, emptyMemory, extractCandidates, memoryAnalysis, writerMemory,
-  type Audience, type Canon, type Fact, type Knowledge, type MemoryRoles, type Note } from '../core/narrative/memory'
+  type Audience, type Canon, type Fact, type Knowledge, type MemoryRoles, type Note, type SearchHit } from '../core/narrative/memory'
+import { arcDirection, changeWindow, criticContext, makeSpan, parseReplacement, polishContext,
+  type EditLevel, type Pivot, type StageArc } from '../core/narrative/editing'
 
 export const useStudio = defineStore('studio', () => {
   const project = ref<Project | null>(null)
@@ -38,6 +40,8 @@ export const useStudio = defineStore('studio', () => {
   const promptHistory = ref<PromptRevision[]>([])
   const traces = ref<Trace[]>([])
   const memory = ref(emptyMemory())
+  const arcs = ref<StageArc[]>([])
+  const editImpact = ref<{ revisionId: string; hits: SearchHit[]; terms: string[] }>()
   let indexing: Promise<void> | undefined
   const subscriptions = new Map<string, () => void>()
   let bufferTimer: ReturnType<typeof setTimeout> | undefined
@@ -59,11 +63,19 @@ export const useStudio = defineStore('studio', () => {
   const chapterAnalysis = computed(() => tasks.value.filter(task => task.chapterId === chapterId.value
     && task.baseRevisionId === chapter.value?.currentRevisionId && ['memory_extract', 'consistency_check'].includes(task.taskType)))
   const chapterAudits = computed(() => chapterAnalysis.value.filter(task => task.taskType === 'consistency_check'))
+  const criticTasks = computed(() => tasks.value.filter(task => task.chapterId === chapterId.value &&
+    task.baseRevisionId === chapter.value?.currentRevisionId && task.taskType === 'critic'))
+  const polishTasks = computed(() => tasks.value.filter(task => task.chapterId === chapterId.value && task.taskType === 'polish_span'))
   const chapterFindings = computed(() => {
     const task = chapterAudits.value.find(entry => entry.state === 'completed')
     try {
       return task ? auditFindings(task.partialOutput, acceptedText.value) : []
     } catch { return [] }
+  })
+  const criticFindings = computed(() => {
+    const last = criticTasks.value.find(task => task.state === 'completed')
+    try { return last ? auditFindings(last.partialOutput, acceptedText.value) : [] }
+    catch { return [] }
   })
 
   function flash(message: string) {
@@ -106,8 +118,8 @@ export const useStudio = defineStore('studio', () => {
   async function loadWorkspace(result: Project) {
     resetSubscriptions()
     project.value = result
-    const [catalog, savedScenes, prompts, storedTasks, savedMemory] = await Promise.all([
-      desktop.writePacks(builtins, true), desktop.scenes(), desktop.prompts(), desktop.tasks(), desktop.memory(), readChapters(),
+    const [catalog, savedScenes, prompts, storedTasks, savedMemory, savedArcs] = await Promise.all([
+      desktop.writePacks(builtins, true), desktop.scenes(), desktop.prompts(), desktop.tasks(), desktop.memory(), desktop.arcs(), readChapters(),
     ])
     styles.value = catalog
     scenes.value = savedScenes
@@ -115,6 +127,8 @@ export const useStudio = defineStore('studio', () => {
     tasks.value = storedTasks
     writingIssues.value = {}
     memory.value = savedMemory
+    arcs.value = savedArcs
+    editImpact.value = undefined
     for (const task of tasks.value.filter((item) => activeTask(item.state))) watchTask(task)
     const currentRevisions = new Set(chapters.value.map(item => item.currentRevisionId))
     for (const task of storedTasks) {
@@ -153,6 +167,8 @@ export const useStudio = defineStore('studio', () => {
       chapterId.value = ''
       tasks.value = []
       memory.value = emptyMemory()
+      arcs.value = []
+      editImpact.value = undefined
     })
   }
 
@@ -245,24 +261,27 @@ export const useStudio = defineStore('studio', () => {
     }, 850)
   })
 
-  async function saveText() {
+  async function saveText(editLevel?: EditLevel, canonConfirmed = false, impactTerms = '') {
     clearTimeout(bufferTimer)
     const entry = chapter.value
     if (!entry || !dirty.value) return
+    const before = acceptedText.value
     const revision = await desktop.saveRevision({
       chapterId: entry.chapterId, baseRevisionId: entry.currentRevisionId,
-      source: 'manual_edit', content: text.value,
+      source: 'manual_edit', content: text.value, editLevel, canonConfirmed,
     })
     acceptedText.value = revision.content
     entry.currentRevisionId = revision.revisionId
     entry.status = 'accepted'
     revisions.value.unshift(revision)
-    entry.memorySyncStatus = 'pending'
+    if (revision.editLevel !== 'surface' || entry.memorySyncStatus === 'processing') entry.memorySyncStatus = 'pending'
+    editImpact.value = undefined
     background(indexManuscript())
+    if (before && revision.editLevel !== 'surface') background(findImpacts(entry, revision, before, impactTerms))
     flash('已保存正式修订')
   }
 
-  function saveCurrent() { return run(saveText) }
+  function saveCurrent(level?: EditLevel, confirmed = false, terms = '') { return run(() => saveText(level, confirmed, terms)) }
 
   function restoreRevision(revision: Revision) {
     text.value = revision.content
@@ -468,7 +487,78 @@ export const useStudio = defineStore('studio', () => {
     if (terms.length) await indexManuscript()
     const hits = await Promise.all(terms.map(name => desktop.searchText(cjkQuery(name), name)))
     return { scene: activeScene, catalog: styles.value, promptRevision: promptHistory.value[0], memory: snapshot,
-      memoryMatches: hits.flatMap(rows => rows.map(row => row.chapterId)) }
+      memoryMatches: hits.flatMap(rows => rows.map(row => row.chapterId)),
+      direction: arcDirection(arcs.value.find(arc => arc.arcId === entry.arcId), entry) }
+  }
+
+  async function findImpacts(entry: Chapter, revision: Revision, before: string, extra: string) {
+    const edited = changeWindow(before, revision.content)
+    if (!edited) return
+    const relevant = memory.value.canon.flatMap(item => [item.name, ...item.aliases])
+      .filter(term => edited.includes(term) && cjkQuery(term))
+    const terms = [...new Set([...extra.split(/[\s、，,]+/), ...relevant].filter(term => cjkQuery(term)))].slice(0, 8)
+    await indexManuscript()
+    const all = (await Promise.all(terms.map(term => desktop.searchText(cjkQuery(term), term, entry.chapterOrder)))).flat()
+    const hits = Array.from(new Map(all.map(hit => [hit.chapterId, hit])).values()).sort((a, b) => a.chapterOrder - b.chapterOrder)
+    if (chapter.value?.chapterId === entry.chapterId && chapter.value.currentRevisionId === revision.revisionId) {
+      editImpact.value = { revisionId: revision.revisionId, hits, terms }
+    }
+  }
+
+  function requestPolish(start: number, end: number, instruction: string) {
+    return run(async () => {
+      const entry = chapter.value
+      const revision = revisions.value.find(item => item.revisionId === entry?.currentRevisionId)
+      const profile = selectedProfile.value
+      const book = project.value
+      if (!entry || !revision || !book || !profile || (profile.needsKey && !profile.hasKey)) {
+        throw new Error('请保存正文并配置可用的编辑模型。')
+      }
+      if (dirty.value) throw new Error('请保存当前修改，再选中要精修的文字。')
+      if (polishTasks.value.some(task => activeTask(task.state))) throw new Error('本章已有待处理的精修任务。')
+      const span = makeSpan(revision, start, end)
+      const task = await makeTask(entry, 'polish_span', polishContext(book, entry, revision, profile, span, instruction))
+      await taskService.startTask(task.taskId)
+    })
+  }
+
+  function applyPolish(task: GenerationTask, confirmCanon = false) {
+    return run(async () => {
+      const entry = chapter.value
+      if (!entry || dirty.value || task.chapterId !== entry.chapterId) throw new Error('正文有未保存的修改，请保存后重新发起精修。')
+      parseReplacement(task.partialOutput)
+      const previous = acceptedText.value
+      const revision = await desktop.applyPolish(task.taskId, confirmCanon)
+      await readChapters()
+      await readChapter(task.chapterId)
+      background(indexManuscript())
+      if (revision.editLevel !== 'surface') background(findImpacts(entry, revision, previous, ''))
+      flash('已将精修建议保存为新修订')
+    })
+  }
+
+  function requestCritic() {
+    return run(async () => {
+      const entry = chapter.value
+      const book = project.value
+      const revision = revisions.value.find(item => item.revisionId === entry?.currentRevisionId)
+      const profile = profiles.value.find(item => item.id === memory.value.roles.auditProfileId) ?? selectedProfile.value
+      if (!entry || !book || !revision || !profile || (profile.needsKey && !profile.hasKey)) throw new Error('请保存正文并配置可用模型。')
+      if (dirty.value) throw new Error('请先保存本章修订。')
+      if (criticTasks.value.some(task => activeTask(task.state))) return
+      const task = await makeTask(entry, 'critic', criticContext(book, entry, revision, profile))
+      await taskService.startTask(task.taskId)
+    })
+  }
+
+  function saveArc(arc: StageArc) {
+    return run(async () => { await desktop.writeArc(arc); arcs.value = await desktop.arcs(); flash('已保存阶段') })
+  }
+  function assignArc(chapterId: string, arcId: string | null) {
+    return run(async () => { await desktop.assignArc(chapterId, arcId); await readChapters() })
+  }
+  function applyPivot(pivot: Pivot) {
+    return run(async () => { await desktop.applyPivot(pivot); arcs.value = await desktop.arcs(); flash('已确认改纲') })
   }
 
   async function settleAnalysis(task: GenerationTask) {
@@ -587,5 +677,6 @@ export const useStudio = defineStore('studio', () => {
     setStyle, togglePack, importPacks, saveScene, selectScene, savePrompt, refreshTraces, runSkillExtraction, compareModels,
     memory, memoryPending, chapterFindings, chapterAudits, chapterAnalysis, saveCanon, saveNote, saveKnowledge, saveRoles, reviewFact, completeChapter,
     searchManuscript,
+    arcs, saveArc, assignArc, applyPivot, editImpact, polishTasks, requestPolish, applyPolish, criticTasks, criticFindings, requestCritic,
   }
 })

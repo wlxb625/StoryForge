@@ -3,15 +3,18 @@ import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { isTauri } from '@tauri-apps/api/core'
 import {
   ArrowDown, ArrowLeft, ArrowRight, ArrowUp, BookOpen, ChevronDown, CircleAlert,
-  Beaker, BookMarked, Clock3, Copy, FilePlus2, FolderOpen, Library, PanelRight, PenLine, Plus, Settings2, Sparkles, Square, X,
+  Beaker, BookMarked, Clock3, Copy, FilePlus2, FolderOpen, Library, PanelRight, PenLine, Plus, Route, Settings2, Sparkles, Square, X,
 } from 'lucide-vue-next'
 import ModelSettings from './components/ModelSettings.vue'
 import SceneControls from './components/SceneControls.vue'
 import PacksView from './views/PacksView.vue'
 import LabView from './views/LabView.vue'
 import MemoryView from './views/MemoryView.vue'
+import OutlineView from './views/OutlineView.vue'
+import EditingTools from './components/EditingTools.vue'
 import { activeTask, type GenerationTask, type TaskState } from './core/contracts/types'
 import { countHan } from './core/quality/hardGate'
+import { suggestedEdit, type EditLevel } from './core/narrative/editing'
 import { useStudio } from './stores/studio'
 
 const studio = useStudio()
@@ -20,12 +23,18 @@ const title = ref('')
 const creatingBook = ref(false)
 const chapterForm = ref(false)
 const newChapterTitle = ref('')
-const panel = ref<'draft' | 'history' | 'review'>('draft')
+const panel = ref<'draft' | 'history' | 'review' | 'editing'>('draft')
 const showInspector = ref(true)
-const view = ref<'studio' | 'packs' | 'lab' | 'memory'>('studio')
+const view = ref<'studio' | 'packs' | 'lab' | 'memory' | 'outline'>('studio')
 const manuscript = ref<HTMLTextAreaElement>()
+const selection = ref({ start: 0, end: 0 })
+const revisionDialog = ref<HTMLDialogElement>()
+const editLevel = ref<EditLevel>('semantic')
+const confirmed = ref(false)
+const impactTerms = ref('')
 const reviewEventId = ref('')
 watch(() => studio.project?.projectId, () => { view.value = 'studio' })
+watch(() => [studio.chapterId, studio.chapter?.currentRevisionId], () => { selection.value = { start: 0, end: 0 } })
 const chapterProgress = computed(() => {
   const target = studio.project?.targetChapterChars ?? 2000
   return Math.min(100, Math.round(studio.currentCount / target * 100))
@@ -46,7 +55,7 @@ async function locate(chapterId: string, quote: string, preferred?: number) {
   view.value = 'studio'
   await nextTick()
   const editor = manuscript.value
-  if (!editor) return
+  if (!editor || !quote) return
   const start = preferred !== undefined && editor.value.slice(preferred, preferred + quote.length) === quote
     ? preferred : editor.value.indexOf(quote)
   if (start < 0) { studio.flash('原文位置已变化'); return }
@@ -55,11 +64,30 @@ async function locate(chapterId: string, quote: string, preferred?: number) {
   const line = Number.parseFloat(getComputedStyle(editor).lineHeight)
   if (Number.isFinite(line)) editor.scrollTop = Math.max(0, (editor.value.slice(0, start).split('\n').length - 3) * line)
 }
+function readSelection() {
+  const editor = manuscript.value
+  if (editor) selection.value = { start: editor.selectionStart, end: editor.selectionEnd }
+}
+function chooseRevision() {
+  if (!studio.dirty || studio.busy) return
+  studio.error = ''
+  editLevel.value = suggestedEdit(studio.acceptedText, studio.text)
+  confirmed.value = false
+  impactTerms.value = ''
+  revisionDialog.value?.showModal()
+}
+async function submitRevision() {
+  await studio.saveCurrent(editLevel.value, confirmed.value, impactTerms.value)
+  if (!studio.error) {
+    revisionDialog.value?.close()
+    if (editLevel.value !== 'surface') { panel.value = 'editing'; showInspector.value = true }
+  }
+}
 
 function keyboard(event: KeyboardEvent) {
   if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 's' && studio.project) {
     event.preventDefault()
-    void studio.saveCurrent()
+    chooseRevision()
   }
 }
 onMounted(() => {
@@ -133,6 +161,7 @@ async function copyDraft(task: GenerationTask) {
       <nav v-if="studio.project" class="workspace-nav" aria-label="工作台导航">
         <button class="flat-button" :class="{ selected: view === 'studio' }" type="button" aria-label="写作台" @click="view = 'studio'"><PenLine :size="16" /><span>写作台</span></button>
         <button class="flat-button" :class="{ selected: view === 'memory' }" type="button" aria-label="记忆库" @click="reviewEventId = ''; view = 'memory'"><BookMarked :size="16" /><span>记忆库</span><i v-if="studio.memoryPending" class="review-dot"></i></button>
+        <button class="flat-button" :class="{ selected: view === 'outline' }" type="button" aria-label="大纲" @click="view = 'outline'"><Route :size="16" /><span>大纲</span></button>
         <button class="flat-button" :class="{ selected: view === 'packs' }" type="button" aria-label="卡带与配方" @click="view = 'packs'"><Library :size="16" /><span>配方</span></button>
         <button class="flat-button" :class="{ selected: view === 'lab' }" type="button" aria-label="实验室" @click="view = 'lab'"><Beaker :size="16" /><span>实验室</span></button>
       </nav>
@@ -168,6 +197,7 @@ async function copyDraft(task: GenerationTask) {
     <PacksView v-else-if="view === 'packs'" />
     <LabView v-else-if="view === 'lab'" />
     <MemoryView v-else-if="view === 'memory'" :review-event-id="reviewEventId" @open="locate" />
+    <OutlineView v-else-if="view === 'outline'" />
     <main v-else class="studio-layout" :class="{ compact: !showInspector }">
       <aside class="chapter-pane" aria-label="章节目录">
         <div class="aside-head"><strong>章节</strong><button type="button" class="icon-button" aria-label="添加章节" @click="chapterForm = !chapterForm"><Plus :size="18" /></button></div>
@@ -198,14 +228,15 @@ async function copyDraft(task: GenerationTask) {
             <button type="button" class="icon-button" title="上移章节" aria-label="上移章节" :disabled="studio.chapter.chapterOrder <= 1" @click="studio.moveChapter(-1)"><ArrowUp :size="15" /></button>
             <button type="button" class="icon-button" title="下移章节" aria-label="下移章节" :disabled="studio.chapter.chapterOrder >= studio.chapters.length" @click="studio.moveChapter(1)"><ArrowDown :size="15" /></button>
             <button type="button" class="flat-button subaction" @click="archive">归档</button>
-            <button type="button" class="secondary-button save-button" :disabled="studio.busy || !studio.dirty" @click="studio.saveCurrent()">保存修订</button>
+            <button type="button" class="secondary-button save-button" :disabled="studio.busy || !studio.dirty" @click="chooseRevision">保存修订</button>
           </div>
         </div>
         <div class="paper">
           <p class="micro">第 {{ studio.chapter.chapterOrder }} 章</p>
           <input :key="studio.chapter.chapterId + studio.chapter.title" :value="studio.chapter.title"
             class="chapter-title" aria-label="章节标题" maxlength="120" @blur="renameChapter" @keydown.enter="($event.target as HTMLInputElement).blur()">
-          <textarea ref="manuscript" v-model="studio.text" class="manuscript" spellcheck="false" aria-label="正文" placeholder="从一个动作、一个地点，或一句对白写起……"></textarea>
+          <textarea ref="manuscript" v-model="studio.text" class="manuscript" spellcheck="false" aria-label="正文" placeholder="从一个动作、一个地点，或一句对白写起……"
+            @select="readSelection" @mouseup="readSelection" @keyup="readSelection"></textarea>
         </div>
         <footer class="editor-footer">
           <div class="editor-meter"><span>{{ studio.currentCount }} 字</span><div class="meter" role="progressbar" :aria-valuenow="chapterProgress" aria-label="章节目标进度"><span :style="{ width: chapterProgress + '%' }"></span></div>
@@ -229,6 +260,7 @@ async function copyDraft(task: GenerationTask) {
           <button :class="{ selected: panel === 'draft' }" type="button" @click="panel = 'draft'">续写草稿</button>
           <button :class="{ selected: panel === 'history' }" type="button" @click="panel = 'history'"><Clock3 :size="14" /> 版本历史</button>
           <button :class="{ selected: panel === 'review' }" type="button" @click="panel = 'review'">审查<span v-if="reviewCount" class="pending-count">{{ reviewCount }}</span></button>
+          <button :class="{ selected: panel === 'editing' }" type="button" @click="panel = 'editing'">编辑</button>
         </nav>
         <template v-if="panel === 'draft'">
           <div class="model-line">
@@ -277,6 +309,7 @@ async function copyDraft(task: GenerationTask) {
           </button>
           <div v-if="!studio.history.length" class="inspector-empty"><Clock3 :size="20" /><p>保存修订后会显示在这里。</p></div>
         </div>
+        <EditingTools v-else-if="panel === 'editing'" :selection="selection" @locate="locate" />
         <div v-else class="review-panel">
           <div class="task-meta"><span>记忆 · {{ sync[studio.chapter?.memorySyncStatus ?? 'pending'] }}</span>
             <button type="button" class="secondary-button" :disabled="studio.busy || !studio.chapter || !studio.text.trim()"
@@ -304,6 +337,21 @@ async function copyDraft(task: GenerationTask) {
       <button type="button" class="icon-button" aria-label="关闭提示" @click="studio.error = ''"><X :size="16" /></button>
     </div>
     <div v-else-if="studio.notice" class="toast" role="status">{{ studio.notice }}</div>
+    <dialog ref="revisionDialog" class="diff-dialog" aria-label="保存修订">
+      <form class="memory-form" @submit.prevent="submitRevision">
+        <h2>保存修订</h2>
+        <label>修改级别<select v-model="editLevel">
+          <option value="surface">字词与排版</option><option value="semantic">情节与含义</option><option value="canon">设定变更</option>
+        </select></label>
+        <label v-if="editLevel !== 'surface'">后文检索词（可选）
+          <input v-model="impactTerms" placeholder="例如：铜匙、周宁">
+        </label>
+        <label v-if="editLevel === 'canon'" class="check-line"><input v-model="confirmed" type="checkbox" required> 我确认这次修改改变已确认事实</label>
+        <p v-if="studio.error" class="pending-text" role="alert">{{ studio.error }}</p>
+        <div class="memory-actions"><button type="submit" class="primary-button" :disabled="studio.busy">确认保存</button>
+          <button class="flat-button" type="button" @click="revisionDialog?.close()">取消</button></div>
+      </form>
+    </dialog>
     <ModelSettings v-if="settings" @close="settings = false" />
   </div>
 </template>

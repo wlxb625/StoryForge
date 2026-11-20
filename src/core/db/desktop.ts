@@ -1,6 +1,7 @@
 import { invoke, isTauri } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import type { Audience, Candidate, Canon, Knowledge, Memory, MemoryRoles, Note, SearchHit } from '../narrative/memory'
+import type { Pivot, PivotPreview, StageArc } from '../narrative/editing'
 import type {
   Capabilities, Chapter, GenerationTask, ModelProfile, ProbeResult, ProfileInput, Project, Revision,
   RevisionInput, TaskEvent, TaskInput, Pack, StyleCatalog, Scene, SceneInput, PromptRevision, Trace,
@@ -61,7 +62,13 @@ export const desktop = {
   refreshMemoryStatus: (chapterId: string, revisionId: string) => call<void>('refresh_memory_status', { chapterId, revisionId }),
   staleIndexes: () => call<Array<{ chapterId: string; revisionId: string; content: string }>>('stale_indexes'),
   indexChapter: (chapterId: string, revisionId: string, bigrams: string) => call<boolean>('index_chapter', { chapterId, revisionId, bigrams }),
-  searchText: (phrase: string, exact: string) => call<SearchHit[]>('search_text', { phrase, exact }),
+  searchText: (phrase: string, exact: string, afterOrder?: number) => call<SearchHit[]>('search_text', { phrase, exact, afterOrder: afterOrder ?? null }),
+  arcs: () => call<StageArc[]>('list_arcs'),
+  writeArc: (arc: StageArc) => call<StageArc>('write_arc', { arc }),
+  assignArc: (chapterId: string, arcId: string | null) => call<void>('assign_arc', { chapterId, arcId }),
+  previewPivot: (arcId: string) => call<PivotPreview>('preview_pivot', { arcId }),
+  applyPivot: (pivot: Pivot) => call<StageArc>('apply_pivot', { pivot }),
+  applyPolish: (taskId: string, canonConfirmed: boolean) => call<Revision>('apply_polish', { taskId, canonConfirmed }),
   listen: (onEvent: (event: TaskEvent) => void) =>
     listen<TaskEvent>('storyforge-task', ({ payload }) => onEvent(payload)),
 }

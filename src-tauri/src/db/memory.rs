@@ -42,7 +42,7 @@ pub struct Anchor {
 }
 
 impl Anchor {
-    fn matches(&self, manuscript: &[u16]) -> bool {
+    pub(super) fn matches(&self, manuscript: &[u16]) -> bool {
         let quote: Vec<u16> = self.quote.encode_utf16().collect();
         !self.quote.trim().is_empty()
             && quote.len() <= 240
@@ -232,7 +232,7 @@ fn read_canon(db: &Connection) -> Result<Vec<Canon>> {
 
 fn read_facts(db: &Connection) -> Result<Vec<Fact>> {
     let mut query = db.prepare("SELECT e.event_id,e.source_revision_id,c.chapter_id,c.chapter_order,e.event_type,
-        e.subject_ids_json,e.summary,e.world_time_label,e.evidence_anchor_json,e.approval_status,e.confidence,e.payload_json,
+        e.subject_ids_json,e.summary,e.world_time_label,COALESCE(e.active_anchor_json,e.evidence_anchor_json),e.approval_status,e.confidence,e.payload_json,
         COALESCE(c.current_revision_id=e.active_revision_id,0) AND c.status!='archived'
         FROM story_events e JOIN chapter_revisions r ON r.revision_id=e.source_revision_id
         JOIN chapters c ON c.chapter_id=r.chapter_id ORDER BY c.chapter_order,e.created_at,e.rowid")?;
@@ -531,7 +531,7 @@ impl Project {
             let anchor = serde_json::to_string(&candidate.anchor)?;
             let identical: bool = tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM story_events WHERE active_revision_id=?1
-                AND event_type=?2 AND evidence_anchor_json=?3 AND summary=?4)",
+                AND event_type=?2 AND COALESCE(active_anchor_json,evidence_anchor_json)=?3 AND summary=?4)",
                 params![revision, candidate.event_type, anchor, candidate.summary],
                 |r| r.get(0),
             )?;
@@ -701,7 +701,12 @@ impl Project {
         Ok(true)
     }
 
-    pub fn search_text(&self, phrase: &str, exact: &str) -> Result<Vec<SearchHit>> {
+    pub fn search_text(
+        &self,
+        phrase: &str,
+        exact: &str,
+        after_order: Option<i64>,
+    ) -> Result<Vec<SearchHit>> {
         if phrase.len() > 1800
             || phrase.is_empty()
             || exact.is_empty()
@@ -717,8 +722,9 @@ impl Project {
             FROM chapters_fts JOIN chapters c ON c.rowid=chapters_fts.rowid
             JOIN chapter_revisions r ON r.revision_id=c.current_revision_id
             WHERE chapters_fts MATCH ?1 AND c.indexed_revision_id=c.current_revision_id AND c.status!='archived'
+            AND c.chapter_order>COALESCE(?2,0)
             ORDER BY c.chapter_order LIMIT 50")?;
-        let mut rows = statement.query([query])?;
+        let mut rows = statement.query(params![query, after_order])?;
         let mut hits = Vec::new();
         while let Some(r) = rows.next()? {
             let content = r
@@ -792,6 +798,8 @@ mod tests {
                 source: "manual_edit".into(),
                 content,
                 draft_task_id: None,
+                edit_level: None,
+                canon_confirmed: false,
             })
             .unwrap()
     }
@@ -840,14 +848,14 @@ mod tests {
         }
         let keyword = grams("周宁");
         let before = Instant::now();
-        let hits = project.search_text(&keyword, "周宁").unwrap();
+        let hits = project.search_text(&keyword, "周宁", None).unwrap();
         let cold_ms = before.elapsed().as_secs_f64() * 1000.0;
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].chapter_order, 56);
         let mut timings: Vec<_> = (0..80)
             .map(|_| {
                 let start = Instant::now();
-                let hits = project.search_text(&keyword, "周宁").unwrap();
+                let hits = project.search_text(&keyword, "周宁", None).unwrap();
                 assert_eq!(hits.len(), 1);
                 start.elapsed().as_secs_f64() * 1000.0
             })
@@ -858,7 +866,10 @@ mod tests {
         eprintln!("Han count={size}, cold={cold_ms:.3}ms, median={median:.3}ms, p95={p95:.3}ms");
         assert!(p95 < 5.0);
         assert_eq!(
-            project.search_text(&grams("宁石"), "宁石").unwrap().len(),
+            project
+                .search_text(&grams("宁石"), "宁石", None)
+                .unwrap()
+                .len(),
             0
         );
         assert_eq!(

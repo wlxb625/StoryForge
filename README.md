@@ -4,7 +4,7 @@
 
 ## 开发进度
 
-Phase 0 的真实模型对照、Phase 1 的 Windows 写作台、Phase 2 的创作内核与 Phase 3 的证据化记忆已通过验收。样本覆盖和角色选型见 [实测校准](docs/adr-001-phase0-calibration.md)。Windows 运行与测试见 [桌面端验收](docs/phase1-validation.md)。长期记忆的实测记录见 [第三阶段验收](docs/phase3-validation.md)。
+Phase 0 至 Phase 4 已通过阶段验收。样本覆盖和角色选型见 [实测校准](docs/adr-001-phase0-calibration.md)。Windows 运行与测试见 [桌面端验收](docs/phase1-validation.md)。专项结果见 [长期记忆](docs/phase3-validation.md) 和 [改纲与精修](docs/phase4-validation.md)。
 
 | 阶段 | 目标 |
 | --- | --- |
