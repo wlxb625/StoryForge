@@ -215,6 +215,15 @@ fn save_revision(studio: State<'_, Studio>, input: RevisionInput) -> Result<Revi
 }
 
 #[tauri::command]
+fn save_canon_revision(
+    studio: State<'_, Studio>,
+    input: RevisionInput,
+    canon: db::memory::Canon,
+) -> Result<Revision> {
+    studio.project(|project| project.save_revision_with_canon(input, Some(canon)))
+}
+
+#[tauri::command]
 fn list_model_profiles(studio: State<'_, Studio>) -> Result<Vec<ListedProfile>> {
     guard(&studio.profiles)?.list()
 }
@@ -533,11 +542,16 @@ fn main() {
             editing_commands::apply_pivot,
             editing_commands::apply_polish,
             exports::export_project,
+            exports::export_pack,
             batch_commands::latest_batch,
+            batch_commands::batch_history,
+            batch_commands::named_batch,
+            batch_commands::batch_activity,
             batch_commands::start_batch,
             batch_commands::control_batch,
             batch_commands::reserve_batch_step,
             batch_commands::adopt_batch_draft,
+            batch_commands::preview_batch_draft,
             batch_commands::settle_batch_step,
             batch_commands::advance_batch,
             new_project,
@@ -554,6 +568,7 @@ fn main() {
             archive_chapter,
             list_revisions,
             save_revision,
+            save_canon_revision,
             list_model_profiles,
             save_model_profile,
             remove_model_profile,

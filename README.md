@@ -4,7 +4,7 @@
 
 ## 开发进度
 
-Phase 0 至 Phase 4 已通过阶段验收。样本覆盖和角色选型见 [实测校准](docs/adr-001-phase0-calibration.md)。Windows 运行与测试见 [桌面端验收](docs/phase1-validation.md)。专项结果见 [长期记忆](docs/phase3-validation.md) 和 [改纲与精修](docs/phase4-validation.md)。
+各阶段的验收文件保留当时的用例和结果。对照冻结契约的当前实现、0.1.1 修补项和仍待完成的要求见 [V3 逐项复核](docs/v3-reconciliation.md)。样本覆盖和角色选型见 [实测校准](docs/adr-001-phase0-calibration.md)。
 
 Phase 5 已实现全景、后台连写和文件导出。本机测试、Windows 打包和待独立完成的验收项见 [第五阶段交付与验收](docs/phase5-validation.md)。
 

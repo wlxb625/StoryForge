@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref, toRaw } from 'vue'
+import { computed, ref, toRaw, watch } from 'vue'
 import { BookMarked, CircleAlert, Search } from 'lucide-vue-next'
 import AudienceFields from '../components/AudienceFields.vue'
 import { errorMessage, activeTask } from '../core/contracts/types'
@@ -45,8 +45,11 @@ function editCanon(entry?: Canon) {
 async function submitCanon() {
   canon.value.aliases = aliases.value.split(/[、，,]/).map(a => a.trim()).filter(Boolean)
   await studio.saveCanon(canon.value)
-  if (!studio.error) editCanon()
+  if (!studio.error && !studio.canonProposal) editCanon()
 }
+watch(() => studio.memory.canon.find(item => item.entryId === canon.value.entryId)?.version, version => {
+  if (version && version !== canon.value.version) editCanon(studio.memory.canon.find(item => item.entryId === canon.value.entryId))
+})
 function editEvent(event: Fact) {
   eventId.value = event.eventId
   audience.value = structuredClone(toRaw(event.audience))
@@ -169,6 +172,10 @@ async function search() {
           <option v-if="note.sourceRevisionId && !revisionOptions.some(item => item.id === note.sourceRevisionId)" :value="note.sourceRevisionId">保留原始修订</option>
           <option v-for="revision in revisionOptions" :key="revision.id" :value="revision.id">{{ revision.title }}</option></select></label>
         <label>进度<select v-model="note.status"><option value="open">待回收</option><option value="reminded">已提醒</option><option value="paid_off">已回收</option><option value="deprecated">已废弃</option></select></label>
+        <label v-if="note.noteType !== 'subtext_cue'">隔几章提醒回收
+          <input type="number" min="1" max="1000" :value="note.remindAfterChapters ?? ''"
+            @input="note.remindAfterChapters = ($event.target as HTMLInputElement).valueAsNumber || null" placeholder="可留空">
+        </label>
         <label>关联事实与设定<select v-model="note.relatedIds" multiple>
           <option v-for="entry in studio.memory.canon" :key="entry.entryId" :value="entry.entryId">{{ entry.name }}</option>
           <option v-for="event in currentEvents.filter(item => ['auto_accepted','author_accepted'].includes(item.approval))" :key="event.eventId" :value="event.eventId">{{ event.summary }}</option>

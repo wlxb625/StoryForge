@@ -2,7 +2,7 @@ import { invoke, isTauri } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import type { Audience, Candidate, Canon, Knowledge, Memory, MemoryRoles, Note, SearchHit } from '../narrative/memory'
 import type { Pivot, PivotPreview, StageArc } from '../narrative/editing'
-import type { Batch, BatchInput } from '../tasks/batch'
+import type { Batch, BatchAction, BatchActivity, BatchDraft, BatchInput, BatchSummary } from '../tasks/batch'
 import type {
   Capabilities, Chapter, GenerationTask, ModelProfile, ProbeResult, ProfileInput, Project, Revision,
   RevisionInput, TaskEvent, TaskInput, Pack, StyleCatalog, Scene, SceneInput, PromptRevision, Trace,
@@ -28,6 +28,7 @@ export const desktop = {
   archiveChapter: (chapterId: string) => call<void>('archive_chapter', { chapterId }),
   revisions: (chapterId: string) => call<Revision[]>('list_revisions', { chapterId }),
   saveRevision: (input: RevisionInput) => call<Revision>('save_revision', { input }),
+  saveCanonRevision: (input: RevisionInput, canon: Canon) => call<Revision>('save_canon_revision', { input, canon }),
   profiles: () => call<ModelProfile[]>('list_model_profiles'),
   saveProfile: (input: ProfileInput) => call<ModelProfile>('save_model_profile', { input }),
   removeProfile: (profileId: string) => call<void>('remove_model_profile', { profileId }),
@@ -71,12 +72,17 @@ export const desktop = {
   applyPivot: (pivot: Pivot) => call<StageArc>('apply_pivot', { pivot }),
   applyPolish: (taskId: string, canonConfirmed: boolean) => call<Revision>('apply_polish', { taskId, canonConfirmed }),
   exportProject: (format: 'story' | 'docx' | 'epub') => call<string | null>('export_project', { format }),
+  exportPack: (name: string, contents: string) => call<string | null>('export_pack', { name, contents }),
   latestBatch: () => call<Batch | null>('latest_batch'),
+  batchHistory: () => call<BatchSummary[]>('batch_history'),
+  namedBatch: (batchId: string) => call<Batch>('named_batch', { batchId }),
+  batchActivity: (batchId: string, chapterId: string) => call<BatchActivity[]>('batch_activity', { batchId, chapterId }),
   startBatch: (input: BatchInput) => call<Batch>('start_batch', { input }),
-  controlBatch: (batchId: string, action: 'pause' | 'resume' | 'stop', budgetUsd?: number, reason?: string) =>
+  controlBatch: (batchId: string, action: BatchAction, budgetUsd?: number, reason?: string) =>
     call<Batch>('control_batch', { batchId, action, budgetUsd: budgetUsd ?? null, reason: reason ?? null }),
   reserveBatchStep: (batchId: string, taskId: string, profileId: string) => call<Batch>('reserve_batch_step', { batchId, taskId, profileId }),
   adoptBatchDraft: (batchId: string, taskId: string) => call<Revision>('adopt_batch_draft', { batchId, taskId }),
+  previewBatchDraft: (batchId: string) => call<BatchDraft | null>('preview_batch_draft', { batchId }),
   settleBatchStep: (batchId: string, taskId: string, problem: string, passed: boolean) =>
     call<Batch>('settle_batch_step', { batchId, taskId, problem, passed }),
   advanceBatch: (batchId: string) => call<Batch>('advance_batch', { batchId }),

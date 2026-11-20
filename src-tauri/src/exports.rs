@@ -370,6 +370,10 @@ fn export_file(source: &Path, output: &Path, kind: &str, credentials: &[String])
         "epub" => write_epub(temp.reopen()?, &load_manuscript(&mut connection)?)?,
         _ => return Err(StudioError::new(400, "无法识别导出格式")),
     }
+    persist_export(temp, output)
+}
+
+fn persist_export(temp: tempfile::NamedTempFile, output: &Path) -> Result<()> {
     temp.as_file().sync_all()?;
     temp.persist_noclobber(output).map_err(|err| {
         if err.error.kind() == std::io::ErrorKind::AlreadyExists {
@@ -379,6 +383,68 @@ fn export_file(source: &Path, output: &Path, kind: &str, credentials: &[String])
         }
     })?;
     Ok(())
+}
+
+fn local_credentials(studio: &Studio) -> Result<Vec<String>> {
+    guard(&studio.profiles)?
+        .list()?
+        .into_iter()
+        .filter(|listed| listed.has_key)
+        .map(|listed| listed.profile.credential_for_request())
+        .collect::<Result<Vec<_>>>()
+        .map(|entries| entries.into_iter().flatten().collect())
+}
+
+#[tauri::command]
+pub async fn export_pack(app: AppHandle, name: String, contents: String) -> Result<Option<String>> {
+    let suffix = name
+        .rsplit_once('.')
+        .filter(|(stem, suffix)| {
+            !stem.is_empty()
+                && stem.len() <= 120
+                && stem
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+                && matches!(*suffix, "md" | "json")
+        })
+        .map(|(_, suffix)| suffix.to_owned())
+        .ok_or_else(|| StudioError::new(400, "配方文件名无效"))?;
+    if contents.is_empty() || contents.len() > 600_000 {
+        return Err(StudioError::new(400, "配方内容超过导出限制"));
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let studio = app.state::<Studio>();
+        inspect_bytes(contents.as_bytes(), &local_credentials(&studio)?)?;
+        let Some(destination) = app
+            .dialog()
+            .file()
+            .set_title("导出配方")
+            .add_filter("声明式配方", &[suffix.as_str()])
+            .set_file_name(name)
+            .blocking_save_file()
+        else {
+            return Ok(None);
+        };
+        let mut output = destination
+            .into_path()
+            .map_err(|_| StudioError::new(400, "请选择本机文件"))?;
+        if !output
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case(&suffix))
+        {
+            output.set_extension(suffix);
+        }
+        let directory = output
+            .parent()
+            .ok_or_else(|| StudioError::new(400, "请选择输出目录"))?;
+        let mut temp = tempfile::NamedTempFile::new_in(directory)?;
+        temp.write_all(contents.as_bytes())?;
+        persist_export(temp, &output)?;
+        Ok(Some(output.to_string_lossy().into()))
+    })
+    .await
+    .map_err(persistent_error)?
 }
 
 #[tauri::command]
@@ -419,15 +485,7 @@ pub async fn export_project(app: AppHandle, format: String) -> Result<Option<Str
             output.set_extension(suffix);
         }
         let keys = if suffix == "story" {
-            guard(&studio.profiles)?
-                .list()?
-                .into_iter()
-                .filter(|listed| listed.has_key)
-                .map(|listed| listed.profile.credential_for_request())
-                .collect::<Result<Vec<_>>>()?
-                .into_iter()
-                .flatten()
-                .collect()
+            local_credentials(&studio)?
         } else {
             Vec::new()
         };

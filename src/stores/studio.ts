@@ -10,14 +10,15 @@ import { freezeContext, retarget } from '../core/narrative/freeze'
 import { activeStyles, deriveIntent } from '../core/narrative/intent'
 import { countHan, technicalIssue } from '../core/quality/hardGate'
 import { taskService } from '../core/tasks/service'
-import type { Batch, BatchInput } from '../core/tasks/batch'
+import type { Batch, BatchAction, BatchInput } from '../core/tasks/batch'
 import { builtins } from '../core/skills/builtins'
 import { skillExtraction } from '../core/skills/extraction'
 import { cjkIndex, cjkQuery } from '../core/db/fts'
 import { auditFindings, emptyMemory, extractCandidates, memoryAnalysis, writerMemory,
-  type Audience, type Canon, type Fact, type Knowledge, type MemoryRoles, type Note, type SearchHit } from '../core/narrative/memory'
+  type Audience, type Canon, type CanonImpact, type Fact, type Knowledge, type MemoryRoles, type Note, type SearchHit } from '../core/narrative/memory'
 import { arcDirection, changeWindow, criticContext, makeSpan, parseReplacement, polishContext,
   type EditLevel, type Pivot, type StageArc } from '../core/narrative/editing'
+import { sceneRanges, type SceneReview } from '../core/narrative/scenes'
 
 export const useStudio = defineStore('studio', () => {
   const project = ref<Project | null>(null)
@@ -34,6 +35,7 @@ export const useStudio = defineStore('studio', () => {
   const draftHint = ref('')
   const error = ref('')
   const notice = ref('')
+  const autoFacts = ref<string[]>([])
   const busy = ref(false)
   const writingIssues = ref<Record<string, string>>({})
   const styles = ref<StyleCatalog>({ packs: [], activeBaseSkillId: null, activePackId: null })
@@ -41,6 +43,7 @@ export const useStudio = defineStore('studio', () => {
   const promptHistory = ref<PromptRevision[]>([])
   const traces = ref<Trace[]>([])
   const memory = ref(emptyMemory())
+  const canonProposal = ref<{ entry: Canon; impact: CanonImpact } | null>(null)
   const arcs = ref<StageArc[]>([])
   const batch = ref<Batch | null>(null)
   let pumping = false
@@ -56,33 +59,47 @@ export const useStudio = defineStore('studio', () => {
   const chapterTasks = computed(() => tasks.value.filter((entry) => entry.chapterId === chapterId.value && entry.taskType === 'beat_write'))
   const currentTask = computed(() => chapterTasks.value.find((entry) => entry.taskId === taskId.value) ?? chapterTasks.value[0])
   const currentActive = computed(() => chapterTasks.value.find((entry) => activeTask(entry.state)))
+  const inspiration = computed(() => tasks.value.find(task => task.chapterId === chapterId.value && task.taskType === 'inspiration'
+    && task.baseRevisionId === chapter.value?.currentRevisionId
+    && (task.frozenContext.sceneBindingId ?? null) === (chapter.value?.activeSceneId ?? null)))
   const currentCount = computed(() => countHan(text.value))
   const dirty = computed(() => text.value !== acceptedText.value)
   const history = computed(() => revisions.value.filter((revision) => revision.saveKind !== 'auto_buffer'))
   const queuedCount = computed(() => tasks.value.filter((task) => activeTask(task.state)).length)
   const scene = computed(() => scenes.value.find((item) => item.sceneId === chapter.value?.activeSceneId))
-  const sceneIntent = computed(() => deriveIntent(scene.value, draftHint.value, acceptedText.value))
+  const sceneIntent = computed(() => deriveIntent(scene.value, draftHint.value, acceptedText.value,
+    chapter.value ? arcDirection(arcs.value.find(arc => arc.arcId === chapter.value?.arcId), chapter.value) : ''))
   const sceneStyles = computed(() => activeStyles(styles.value, scene.value, sceneIntent.value, draftHint.value))
   const memoryPending = computed(() => memory.value.events.filter(event => event.approval === 'pending' && event.current).length)
   const chapterAnalysis = computed(() => tasks.value.filter(task => task.chapterId === chapterId.value
-    && task.baseRevisionId === chapter.value?.currentRevisionId && ['memory_extract', 'consistency_check'].includes(task.taskType)))
+    && task.baseRevisionId === chapter.value?.currentRevisionId && !task.frozenContext.stagedDraftId
+    && ['memory_extract', 'consistency_check'].includes(task.taskType)))
   const chapterAudits = computed(() => chapterAnalysis.value.filter(task => task.taskType === 'consistency_check'))
   const criticTasks = computed(() => tasks.value.filter(task => task.chapterId === chapterId.value &&
     task.baseRevisionId === chapter.value?.currentRevisionId && task.taskType === 'critic'))
   const polishTasks = computed(() => tasks.value.filter(task => task.chapterId === chapterId.value && task.taskType === 'polish_span'))
   const chapterFindings = computed(() => {
-    const task = chapterAudits.value.find(entry => entry.state === 'completed')
-    try {
-      return task ? auditFindings(task.partialOutput, acceptedText.value) : []
-    } catch { return [] }
+    const seen = new Set<string>()
+    return chapterAudits.value.flatMap(task => {
+      if (task.state !== 'completed') return []
+      const scope = task.frozenContext.sceneReview
+      const key = scope?.sceneId ?? ''
+      if (seen.has(key)) return []
+      seen.add(key)
+      const local = task.frozenContext.viewpointAlerts ?? []
+      try { return [...local, ...auditFindings(task.partialOutput, acceptedText.value, scope?.ranges)] }
+      catch { return local }
+    })
   })
   const criticFindings = computed(() => {
     const last = criticTasks.value.find(task => task.state === 'completed')
-    try { return last ? auditFindings(last.partialOutput, acceptedText.value) : [] }
+    const span = last?.frozenContext.span
+    try { return last ? auditFindings(last.partialOutput, acceptedText.value, span ? [{ start: span.start, end: span.end }] : undefined) : [] }
     catch { return [] }
   })
 
   function flash(message: string) {
+    autoFacts.value = []
     notice.value = message
     clearTimeout(noticeTimer)
     noticeTimer = setTimeout(() => { notice.value = '' }, 2400)
@@ -131,6 +148,7 @@ export const useStudio = defineStore('studio', () => {
     tasks.value = storedTasks
     writingIssues.value = {}
     memory.value = savedMemory
+    canonProposal.value = null
     arcs.value = savedArcs
     batch.value = savedBatch
     editImpact.value = undefined
@@ -145,7 +163,7 @@ export const useStudio = defineStore('studio', () => {
         && !savedMemory.ingested.some(([id]) => id === task.taskId)
       const currentAnalysis = ['memory_extract', 'consistency_check'].includes(task.taskType)
         && currentRevisions.has(task.baseRevisionId) && !activeTask(task.state)
-      if (unprocessedExtraction || currentAnalysis) await settleAnalysis(task)
+      if (unprocessedExtraction || (currentAnalysis && !task.frozenContext.stagedDraftId)) await settleAnalysis(task)
     }
     await readChapter(chapters.value[0]?.chapterId ?? '')
     background(indexManuscript())
@@ -272,15 +290,16 @@ export const useStudio = defineStore('studio', () => {
     }, 850)
   })
 
-  async function saveText(editLevel?: EditLevel, canonConfirmed = false, impactTerms = '') {
+  async function saveText(editLevel?: EditLevel, canonConfirmed = false, impactTerms = '', canonChange?: Canon) {
     clearTimeout(bufferTimer)
     const entry = chapter.value
     if (!entry || !dirty.value) return
     const before = acceptedText.value
-    const revision = await desktop.saveRevision({
+    const input = {
       chapterId: entry.chapterId, baseRevisionId: entry.currentRevisionId,
-      source: 'manual_edit', content: text.value, editLevel, canonConfirmed,
-    })
+      source: 'manual_edit' as const, content: text.value, editLevel, canonConfirmed,
+    }
+    const revision = canonChange ? await desktop.saveCanonRevision(input, canonChange) : await desktop.saveRevision(input)
     acceptedText.value = revision.content
     entry.currentRevisionId = revision.revisionId
     entry.status = 'accepted'
@@ -290,9 +309,12 @@ export const useStudio = defineStore('studio', () => {
     background(indexManuscript())
     if (before && revision.editLevel !== 'surface') background(findImpacts(entry, revision, before, impactTerms))
     flash('已保存正式修订')
+    if (canonChange) background(refreshMemory())
   }
 
-  function saveCurrent(level?: EditLevel, confirmed = false, terms = '') { return run(() => saveText(level, confirmed, terms)) }
+  function saveCurrent(level?: EditLevel, confirmed = false, terms = '', canonChange?: Canon) {
+    return run(() => saveText(level, confirmed, terms, canonChange))
+  }
 
   function restoreRevision(revision: Revision) {
     text.value = revision.content
@@ -367,6 +389,7 @@ export const useStudio = defineStore('studio', () => {
     return run(async () => {
       const entry = chapter.value
       if (!entry) throw new Error('请先创建或选择一个章节。')
+      if (dirty.value && input.sceneId !== entry.activeSceneId) throw new Error('请先保存当前场景的正文。')
       const saved = await desktop.saveScene(input)
       await desktop.linkScene(entry.chapterId, saved.sceneId)
       scenes.value = await desktop.scenes()
@@ -378,6 +401,7 @@ export const useStudio = defineStore('studio', () => {
   function selectScene(sceneId: string | null) {
     return run(async () => {
       if (!chapter.value) throw new Error('请先创建或选择一个章节。')
+      if (dirty.value && sceneId !== chapter.value.activeSceneId) throw new Error('请先保存当前场景的正文。')
       await desktop.linkScene(chapter.value.chapterId, sceneId)
       await readChapters()
     })
@@ -427,6 +451,21 @@ export const useStudio = defineStore('studio', () => {
   }
 
   function generate() { return run(() => createAndRun()) }
+
+  function requestInspiration() {
+    return run(async () => {
+      const book = project.value
+      const entry = chapter.value
+      const profile = selectedProfile.value
+      if (!book || !entry || !profile || (profile.needsKey && !profile.hasKey)) throw new Error('请先配置一个可用的主笔模型。')
+      if (inspiration.value && activeTask(inspiration.value.state)) return
+      const revision = revisions.value.find(item => item.revisionId === entry.currentRevisionId)
+      const sources = await writerSources(entry, draftHint.value)
+      const frozen = freezeContext(book, entry, revision, profile, draftHint.value, '', { ...sources, mode: 'inspiration' })
+      const task = await makeTask(entry, 'inspiration', frozen)
+      await taskService.startTask(task.taskId)
+    })
+  }
 
   function startQueued(task: GenerationTask) {
     return run(async () => {
@@ -495,12 +534,36 @@ export const useStudio = defineStore('studio', () => {
     const snapshot = await refreshMemory()
     const activeScene = scenes.value.find(item => item.sceneId === entry.activeSceneId)
     const scoped = writerMemory(snapshot, entry, activeScene?.details.povCharacterId)
-    const terms = [...new Set(scoped.searchableNames)].filter(name => instruction.includes(name) && cjkQuery(name)).slice(0, 5)
+    const priorChapter = chapters.value.find(item => item.chapterOrder === entry.chapterOrder - 1)
+    const sharedScene = !!activeScene && priorChapter?.sceneIds?.includes(activeScene.sceneId)
+    if (priorChapter?.currentRevisionId && !entry.currentRevisionId && (sharedScene || activeScene?.details.requiresPreviousMemory)
+      && priorChapter.memorySyncStatus !== 'synced') {
+      throw new Error('上一章的记忆尚未同步。请在上一章完成审查并处理待确认事件。')
+    }
+    async function readSceneText(from: Chapter) {
+      const history = await desktop.revisions(from.chapterId)
+      const revision = history.find(item => item.revisionId === from.currentRevisionId)
+      if (!revision) return
+      const ranges = sceneRanges(history, revision)
+      const scoped = ranges.filter(range => range.sceneId === (activeScene?.sceneId ?? null))
+      const legacy = activeScene && from.sceneIds?.length === 1 && from.sceneIds.includes(activeScene.sceneId)
+        && ranges.every(range => range.sceneId === null)
+      const content = legacy ? revision.content : scoped.map(range => revision.content.slice(range.start, range.end)).join('\n\n')
+      return { ...revision, content }
+    }
+    const previous = !scoped.guarded && !entry.currentRevisionId && priorChapter?.currentRevisionId
+      && (sharedScene || (!activeScene && !priorChapter.activeSceneId)) ? await readSceneText(priorChapter) : undefined
+    const currentSceneText = !scoped.guarded && entry.currentRevisionId ? (await readSceneText(entry))?.content : undefined
+    const context = [instruction, activeScene?.title, activeScene?.details.cast, activeScene?.details.location,
+      activeScene?.details.conflict, previous?.content.slice(-800)].filter(Boolean).join('\n')
+    const terms = [...new Set(scoped.searchableNames)].filter(name => context.includes(name) && cjkQuery(name)).slice(0, 5)
     if (terms.length) await indexManuscript()
     const hits = await Promise.all(terms.map(name => desktop.searchText(cjkQuery(name), name)))
+    const arc = arcs.value.find(arc => arc.arcId === entry.arcId)
     return { scene: activeScene, catalog: styles.value, promptRevision: promptHistory.value[0], memory: snapshot,
+      previous: previous?.content ? previous : undefined, currentSceneText,
       memoryMatches: hits.flatMap(rows => rows.map(row => row.chapterId)),
-      direction: arcDirection(arcs.value.find(arc => arc.arcId === entry.arcId), entry) }
+      direction: arcDirection(arc, entry), arcTitle: arc?.writerVisible ? arc.title : undefined }
   }
 
   async function findImpacts(entry: Chapter, revision: Revision, before: string, extra: string) {
@@ -549,7 +612,7 @@ export const useStudio = defineStore('studio', () => {
     })
   }
 
-  function requestCritic() {
+  function requestCritic(start?: number, end?: number) {
     return run(async () => {
       const entry = chapter.value
       const book = project.value
@@ -558,7 +621,8 @@ export const useStudio = defineStore('studio', () => {
       if (!entry || !book || !revision || !profile || (profile.needsKey && !profile.hasKey)) throw new Error('请保存正文并配置可用模型。')
       if (dirty.value) throw new Error('请先保存本章修订。')
       if (criticTasks.value.some(task => activeTask(task.state))) return
-      const task = await makeTask(entry, 'critic', criticContext(book, entry, revision, profile))
+      const span = start !== undefined && end !== undefined ? makeSpan(revision, start, end) : undefined
+      const task = await makeTask(entry, 'critic', criticContext(book, entry, revision, profile, span))
       await taskService.startTask(task.taskId)
     })
   }
@@ -588,7 +652,7 @@ export const useStudio = defineStore('studio', () => {
       kickBatch()
     })
   }
-  function controlBatch(action: 'pause' | 'resume' | 'stop', budget?: number) {
+  function controlBatch(action: BatchAction, budget?: number) {
     return run(async () => {
       if (!batch.value) return
       if (action === 'stop' && batch.value.step) {
@@ -609,23 +673,20 @@ export const useStudio = defineStore('studio', () => {
       const completed = (await desktop.events(task.taskId, Math.max(0, task.lastEventSeq - 2))).find(event => event.eventType === 'completed')
       problem = technicalIssue(task.partialOutput, true, completed?.payload.finishReason) ?? ''
       if (chapterId.value === task.chapterId && dirty.value) problem = '作者正在编辑本章。请保存并查看后台草稿，再决定是否继续。'
-      if (!problem) {
-        try {
-          const revision = await desktop.adoptBatchDraft(current.batchId, task.taskId)
-          await readChapters()
-          if (chapterId.value === task.chapterId && !dirty.value) await readChapter(task.chapterId)
-          await desktop.indexChapter(task.chapterId, revision.revisionId, cjkIndex(revision.content))
-        } catch (failure) { problem = errorMessage(failure) }
-      }
       passed = !problem
     }
     if (passed && (task.taskType === 'consistency_check' || task.taskType === 'memory_extract')) {
-      await settleAnalysis(task)
+      if (!task.frozenContext.stagedDraftId) await settleAnalysis(task)
       if (task.taskType === 'consistency_check') {
-        const source = (await desktop.revisions(task.chapterId)).find(item => item.revisionId === task.baseRevisionId)
         try {
-          const findings = auditFindings(task.partialOutput, source?.content ?? '')
-          if (findings.some(finding => finding.severity === 'severe')) problem = '出现重大一致性告警。请到本章审查面板处理后再继续。'
+          const staged = task.frozenContext.stagedDraftId ? await desktop.previewBatchDraft(current.batchId) : null
+          const source = staged ?? (await desktop.revisions(task.chapterId)).find(item => item.revisionId === task.baseRevisionId)
+          if (!source || (task.frozenContext.stagedDraftId && staged?.taskId !== task.frozenContext.stagedDraftId))
+            throw new Error('审查稿已变化')
+          const findings = auditFindings(task.partialOutput, source.content)
+          if (findings.some(finding => finding.severity === 'severe') || task.frozenContext.viewpointAlerts?.length) {
+            problem = '出现重大一致性告警。请查看告警，处理后再继续。'
+          }
         } catch { problem = '一致性审查报告无法解析'; passed = false }
       } else {
         problem = memory.value.ingested.find(([id]) => id === task.taskId)?.[1] ?? ''
@@ -679,9 +740,19 @@ export const useStudio = defineStore('studio', () => {
     const entry = (await desktop.chapters()).find(item => item.chapterId === current.chapterIds[current.cursor])
     if (!entry) throw new Error('待连写章节已经归档或移除。')
     if (chapterId.value === entry.chapterId && dirty.value) throw new Error('请先保存本章正在编辑的文字。')
-    const source = entry.currentRevisionId ? (await desktop.revisions(entry.chapterId)).find(item => item.revisionId === entry.currentRevisionId) : undefined
+    const history = entry.currentRevisionId ? await desktop.revisions(entry.chapterId) : []
+    const currentScene = scenes.value.find(scene => scene.sceneId === entry.activeSceneId)
+    const source = history.find(item => item.revisionId === entry.currentRevisionId)
+    if (current.phase === 'adopt' && current.draftTaskId) {
+      const revision = await desktop.adoptBatchDraft(current.batchId, current.draftTaskId)
+      await readChapters()
+      if (chapterId.value === entry.chapterId && !dirty.value) await readChapter(entry.chapterId)
+      await desktop.indexChapter(entry.chapterId, revision.revisionId, cjkIndex(revision.content))
+      pumpRequested = true
+      return
+    }
     if (current.phase === 'advance' || (current.phase === 'extract' && current.auditedRevisionId !== entry.currentRevisionId)
-      || (current.phase === 'write' && source && bookHasReachedTarget(source))) {
+      || (current.phase === 'write' && !current.draftTaskId && source && bookHasReachedTarget(source))) {
       batch.value = await desktop.advanceBatch(current.batchId)
       pumpRequested = batch.value.state === 'running'
       return
@@ -690,12 +761,21 @@ export const useStudio = defineStore('studio', () => {
     const profile = (await desktop.profiles()).find(item => item.id === profileId && item.rates && (!item.needsKey || item.hasKey))
     if (!profile) throw new Error('后台批次的模型档案或价格已变化，请检查模型设置。')
     const kind = current.phase === 'write' ? 'batch_write' : current.phase === 'audit' ? 'consistency_check' : 'memory_extract'
-    if (kind !== 'batch_write' && !source) throw new Error('后台检查需要正式修订。')
+    const staged = current.draftTaskId ? await desktop.previewBatchDraft(current.batchId) : null
+    const auditSource = kind === 'consistency_check' && staged
+      ? { revisionId: staged.taskId, parentRevisionId: entry.currentRevisionId, sceneId: entry.activeSceneId, saveKind: 'ai_draft' as const,
+        sourceTag: 'batch_write', content: staged.content, cjkCharCount: countHan(staged.content), createdAt: '' } : source
+    if (kind !== 'batch_write' && !auditSource) throw new Error('后台检查需要正文。')
     const frozen = kind === 'batch_write'
-      ? freezeContext(book, entry, source, profile, current.instruction, '', await writerSources(entry, current.instruction))
-      : memoryAnalysis(kind, book, entry, source!, profile, await refreshMemory(),
-        scenes.value.find(scene => scene.sceneId === entry.activeSceneId)?.details.povCharacterId)
-    const task = await makeTask(entry,kind,{ ...frozen, batchId: current.batchId })
+      ? freezeContext(book, entry, source, profile, current.instruction, staged?.appendix ?? '',
+        { ...await writerSources(entry, current.instruction), includeGuardedCarry: true })
+      : memoryAnalysis(kind, book, entry, auditSource!, profile, await refreshMemory(),
+        currentScene?.details.povCharacterId,
+        undefined, viewpointRanges(history, auditSource!))
+    const task = await makeTask(entry,kind,{ ...frozen, baseRevisionId: entry.currentRevisionId,
+      previousRevisionIds: kind === 'consistency_check' && staged ? (source ? [source.revisionId] : []) : frozen.previousRevisionIds,
+      batchId: current.batchId, stagedDraftId: staged?.taskId,
+      sceneBindingVersion: kind === 'consistency_check' ? currentScene?.version : frozen.sceneBindingVersion })
     try {
       batch.value = await desktop.reserveBatchStep(current.batchId,task.taskId,profile.id)
     } catch (failure) {
@@ -719,15 +799,22 @@ export const useStudio = defineStore('studio', () => {
       const revision = (await desktop.revisions(task.chapterId)).find(item => item.revisionId === task.baseRevisionId)
       if (!revision) return
       let result
-      try { result = extractCandidates(task.partialOutput, revision.content) }
+      try { result = extractCandidates(task.partialOutput, revision.content, task.frozenContext.sceneReview?.ranges) }
       catch { result = { candidates: [], problem: '模型返回的候选无法解析。可重新提取。' } }
+      const before = new Set(memory.value.events.map(event => event.eventId))
       await desktop.ingestMemory(task.taskId, result.candidates, result.problem)
       await refreshMemory()
+      const added = memory.value.events.filter(event => event.sourceRevisionId === revision.revisionId && event.current
+        && event.approval === 'auto_accepted' && !before.has(event.eventId))
+      if (added.length) {
+        flash(`自动记录了 ${added.length} 条常规记忆`)
+        autoFacts.value = added.map(event => event.eventId)
+      }
     }
     if (task.state === 'completed' && task.taskType === 'consistency_check') {
       const revision = (await desktop.revisions(task.chapterId)).find(item => item.revisionId === task.baseRevisionId)
       if (revision) {
-        try { auditFindings(task.partialOutput, revision.content) }
+        try { auditFindings(task.partialOutput, revision.content, task.frozenContext.sceneReview?.ranges) }
         catch { writingIssues.value[task.taskId] = '审查报告格式有误。可重新审查。' }
       }
     }
@@ -737,7 +824,7 @@ export const useStudio = defineStore('studio', () => {
     if (local?.currentRevisionId === updated?.currentRevisionId && local) local.memorySyncStatus = updated?.memorySyncStatus
   }
 
-  async function analyzeChapter(entry: Chapter, revision: Revision, automatic: boolean) {
+  async function analyzeChapter(entry: Chapter, revision: Revision, automatic: boolean, scope?: SceneReview) {
     const book = project.value
     if (!book) return
     const current = await refreshMemory()
@@ -755,14 +842,17 @@ export const useStudio = defineStore('studio', () => {
       return
     }
     if (automatic && plans.length < 2) return
-    const previous = tasks.value.filter(task => task.baseRevisionId === revision.revisionId)
+    const previous = tasks.value.filter(task => task.baseRevisionId === revision.revisionId && !task.frozenContext.stagedDraftId
+      && task.frozenContext.sceneReview?.sceneId === scope?.sceneId)
     const pending = plans.filter(({ kind }) => !previous.some(task => task.taskType === kind &&
       (activeTask(task.state) || automatic || (task.state === 'completed' &&
         !writingIssues.value[task.taskId] && !current.ingested.some(([id, problem]) => id === task.taskId && problem)))))
     if (!pending.length) return
-    const pov = scenes.value.find(item => item.sceneId === entry.activeSceneId)?.details.povCharacterId
+    const pov = scenes.value.find(item => item.sceneId === (scope?.sceneId ?? entry.activeSceneId))?.details.povCharacterId
+    const viewpoints = scope ? scope.ranges.map(range => ({ ...range, povCharacterId: pov ?? null }))
+      : viewpointRanges(await desktop.revisions(entry.chapterId), revision)
     const analysisTasks = await Promise.all(pending.map(({ kind, profile }) =>
-      makeTask(entry, kind, memoryAnalysis(kind, book, entry, revision, profile!, current, pov))))
+      makeTask(entry, kind, memoryAnalysis(kind, book, entry, revision, profile!, current, pov, scope, viewpoints))))
     const started = await Promise.allSettled(analysisTasks.map(task => taskService.startTask(task.taskId)))
     for (const [index, result] of started.entries()) {
       if (result.status === 'fulfilled') continue
@@ -774,6 +864,12 @@ export const useStudio = defineStore('studio', () => {
     if (latest?.currentRevisionId === entry.currentRevisionId) entry.memorySyncStatus = latest?.memorySyncStatus
   }
 
+  function viewpointRanges(history: Revision[], revision: Revision) {
+    return sceneRanges(history, revision).map(({ start, end, sceneId }) => ({
+      start, end, povCharacterId: scenes.value.find(item => item.sceneId === sceneId)?.details.povCharacterId ?? null,
+    }))
+  }
+
   function completeChapter() {
     return run(async () => {
       await saveText()
@@ -781,6 +877,38 @@ export const useStudio = defineStore('studio', () => {
       const revision = revisions.value.find(item => item.revisionId === entry?.currentRevisionId)
       if (!entry || !revision?.content.trim()) throw new Error('请先保存本章正文。')
       await analyzeChapter(entry, revision, false)
+    })
+  }
+
+  function completeScene() {
+    return run(async () => {
+      const active = scene.value
+      if (!active) throw new Error('请选择一个已保存的场景。')
+      await saveText()
+      let found = false
+      for (const entry of chapters.value.filter(item => item.sceneIds?.includes(active.sceneId) && item.currentRevisionId)) {
+        const history = await desktop.revisions(entry.chapterId)
+        const revision = history.find(item => item.revisionId === entry.currentRevisionId)
+        if (!revision) continue
+        const ranges = sceneRanges(history, revision).filter(range => range.sceneId === active.sceneId)
+          .map(({ start, end }) => ({ start, end }))
+        if (!ranges.length && entry.sceneIds?.length === 1 && !history.some(item => item.sceneId) && revision.content.trim()) {
+          ranges.push({ start: 0, end: revision.content.length })
+        }
+        if (!ranges.length) continue
+        found = true
+        await analyzeChapter(entry, revision, false, { sceneId: active.sceneId, ranges })
+      }
+      if (!found) throw new Error('此场景还没有正式正文。')
+    })
+  }
+
+  function undoAutomaticMemory() {
+    return run(async () => {
+      for (const id of autoFacts.value) await desktop.reviewFact(id, 'undo')
+      await refreshMemory()
+      await readChapters()
+      flash('已撤销自动记忆')
     })
   }
 
@@ -808,7 +936,39 @@ export const useStudio = defineStore('studio', () => {
     return desktop.searchText(phrase, exact)
   }
 
-  function saveCanon(entry: Canon) { return run(async () => { await desktop.writeCanon(entry); await refreshMemory(); flash('设定已存入工程') }) }
+  async function canonImpact(entry: Canon): Promise<CanonImpact> {
+    const previous = memory.value.canon.find(item => item.entryId === entry.entryId)
+    const names = [...new Set([entry.name, ...entry.aliases, ...(previous ? [previous.name, ...previous.aliases] : [])])]
+    await indexManuscript()
+    const hits = (await Promise.all(names.filter(cjkQuery).map(term => desktop.searchText(cjkQuery(term), term)))).flat()
+    const facts = memory.value.events.filter(fact => fact.current && fact.approval !== 'rejected'
+      && (fact.subjects.includes(entry.entryId) || names.some(name => name && fact.summary.includes(name))))
+    const related = new Set([entry.entryId, ...facts.map(fact => fact.eventId)])
+    const notes = memory.value.notes.filter(note => note.status !== 'deprecated'
+      && (note.relatedIds.some(id => related.has(id)) || names.some(name => name && note.body.includes(name))))
+    return { hits: [...new Map(hits.map(hit => [hit.chapterId, hit])).values()].sort((a, b) => a.chapterOrder - b.chapterOrder), facts, notes }
+  }
+  function saveCanon(entry: Canon) {
+    return run(async () => {
+      if (entry.entryId) {
+        const frozen = JSON.parse(JSON.stringify(entry)) as Canon
+        canonProposal.value = { entry: frozen, impact: await canonImpact(frozen) }
+        return
+      }
+      await desktop.writeCanon(entry)
+      await refreshMemory()
+      flash('设定已存入工程')
+    })
+  }
+  function confirmCanonChange() {
+    return run(async () => {
+      if (!canonProposal.value) return
+      await desktop.writeCanon(canonProposal.value.entry)
+      await refreshMemory()
+      canonProposal.value = null
+      flash('权威设定已更新')
+    })
+  }
   function saveNote(note: Note) { return run(async () => { await desktop.writeNote(note); await refreshMemory(); flash('备注已保存') }) }
   function saveKnowledge(entry: Knowledge) { return run(async () => { await desktop.writeKnowledge(entry); await refreshMemory(); flash('已保存人物知情状态') }) }
   function saveRoles(roles: MemoryRoles) { return run(async () => { await desktop.writeMemoryRoles(roles); await refreshMemory(); flash('已保存模型分工') }) }
@@ -823,9 +983,9 @@ export const useStudio = defineStore('studio', () => {
     renameChapter, moveChapter, archiveSelected, restoreChapter, saveCurrent, restoreRevision, generate, startQueued,
     cancel, resumeTask, acceptDraft, flash, styles, scenes, scene, sceneIntent, sceneStyles, promptHistory, traces,
     setStyle, togglePack, importPacks, saveScene, selectScene, savePrompt, refreshTraces, runSkillExtraction, compareModels,
-    memory, memoryPending, chapterFindings, chapterAudits, chapterAnalysis, saveCanon, saveNote, saveKnowledge, saveRoles, reviewFact, completeChapter,
+    memory, memoryPending, chapterFindings, chapterAudits, chapterAnalysis, saveCanon, saveNote, saveKnowledge, saveRoles, reviewFact, completeChapter, completeScene, autoFacts, undoAutomaticMemory,
     searchManuscript,
     arcs, saveArc, assignArc, applyPivot, editImpact, polishTasks, requestPolish, applyPolish, criticTasks, criticFindings, requestCritic,
-    batch, startBatch, controlBatch, exportBook,
+    batch, startBatch, controlBatch, exportBook, inspiration, requestInspiration, canonImpact, canonProposal, confirmCanonChange,
   }
 })

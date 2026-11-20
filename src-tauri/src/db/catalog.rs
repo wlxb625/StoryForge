@@ -250,7 +250,10 @@ impl Project {
     }
 
     pub fn link_scene(&self, chapter: &str, scene: Option<&str>) -> Result<()> {
-        let rows = self.conn.execute("UPDATE chapters SET active_scene_id=?1,updated_at=?2 WHERE chapter_id=?3 AND status!='archived'",
+        let rows = self.conn.execute("UPDATE chapters SET active_scene_id=?1,updated_at=?2,
+            scene_ids_json=CASE WHEN ?1 IS NOT NULL AND NOT EXISTS(SELECT 1 FROM json_each(scene_ids_json) WHERE value=?1)
+              THEN json_insert(scene_ids_json,'$[#]',?1) ELSE scene_ids_json END
+            WHERE chapter_id=?3 AND status!='archived'",
             params![scene,now(),chapter])?;
         if rows == 0 {
             return Err(StudioError::new(404, "章节不存在"));

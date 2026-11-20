@@ -1,8 +1,9 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
-import { BookOpen, Import, ScrollText, Sparkles } from 'lucide-vue-next'
+import { BookOpen, Download, Import, ScrollText, Sparkles } from 'lucide-vue-next'
 import { activeTask, errorMessage, type Pack } from '../core/contracts/types'
-import { parseCartridge, parseSkill, unwrapSkillDraft } from '../core/skills/pack'
+import { parseCartridge, parseSkill, serializePack, unwrapSkillDraft } from '../core/skills/pack'
+import { desktop } from '../core/db/desktop'
 import { useStudio } from '../stores/studio'
 
 const studio = useStudio()
@@ -58,6 +59,13 @@ async function saveDraft() {
     if (!studio.error) { focusId.value = pack.itemId; tab.value = 'shelf'; filter.value = 'all' }
   } catch (reason) { error.value = errorMessage(reason) }
 }
+async function exportPack(pack: Pack) {
+  try {
+    const { name, contents } = serializePack(pack)
+    const file = await desktop.exportPack(name, contents)
+    if (file) studio.flash('配方已导出')
+  } catch (reason) { error.value = errorMessage(reason) }
+}
 </script>
 
 <template>
@@ -67,6 +75,7 @@ async function saveDraft() {
       <div class="workspace-actions">
         <input ref="input" class="sr-only" type="file" accept=".md,.json" multiple @change="importFiles(($event.target as HTMLInputElement).files)">
         <button class="secondary-button" type="button" @click="input?.click()"><Import :size="16" /> 导入文件</button>
+        <button class="secondary-button" type="button" :disabled="studio.busy" @click="studio.exportBook('story')"><Download :size="16" /> 工程快照</button>
         <button class="primary-button" type="button" @click="tab = tab === 'extract' ? 'shelf' : 'extract'"><Sparkles :size="16" />
           {{ tab === 'extract' ? '返回货架' : '从样章生成 Skill' }}</button>
       </div>
@@ -97,6 +106,7 @@ async function saveDraft() {
               {{ focused.itemId === selectedBase?.itemId || focused.itemId === selectedCartridge?.itemId ? '取消当前选择' : '设为当前使用' }}
             </button>
             <button class="secondary-button" type="button" :disabled="studio.busy" @click="studio.togglePack(focused)">{{ focused.enabled ? '停用' : '启用' }}</button>
+            <button class="secondary-button" type="button" @click="exportPack(focused)"><Download :size="15" /> 导出配方</button>
           </div>
           <pre class="plain-text">{{ focused.body }}</pre>
           <ol v-if="focused.metadata.stages?.length" class="cartridge-stage">

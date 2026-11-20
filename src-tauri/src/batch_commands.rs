@@ -1,6 +1,6 @@
 use crate::{
     db::{
-        batch::{profile_price, Batch, BatchInput},
+        batch::{profile_price, Batch, BatchActivity, BatchInput, BatchSummary},
         Revision,
     },
     error::{Result, StudioError},
@@ -11,6 +11,25 @@ use tauri::State;
 #[tauri::command]
 pub fn latest_batch(studio: State<'_, Studio>) -> Result<Option<Batch>> {
     studio.project(|project| project.latest_batch())
+}
+
+#[tauri::command]
+pub fn batch_history(studio: State<'_, Studio>) -> Result<Vec<BatchSummary>> {
+    studio.project(|project| project.batch_history())
+}
+
+#[tauri::command]
+pub fn named_batch(studio: State<'_, Studio>, batch_id: String) -> Result<Batch> {
+    studio.project(|project| project.named_batch(&batch_id))
+}
+
+#[tauri::command]
+pub fn batch_activity(
+    studio: State<'_, Studio>,
+    batch_id: String,
+    chapter_id: String,
+) -> Result<Vec<BatchActivity>> {
+    studio.project(|project| project.batch_activity(&batch_id, &chapter_id))
 }
 
 #[tauri::command]
@@ -64,6 +83,14 @@ pub fn adopt_batch_draft(
     task_id: String,
 ) -> Result<Revision> {
     studio.project(|project| project.adopt_batch_draft(&batch_id, &task_id))
+}
+
+#[tauri::command]
+pub fn preview_batch_draft(
+    studio: State<'_, Studio>,
+    batch_id: String,
+) -> Result<Option<crate::db::batch::BatchDraft>> {
+    studio.project(|project| project.preview_batch_draft(&batch_id))
 }
 
 #[tauri::command]

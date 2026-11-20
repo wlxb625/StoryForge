@@ -60,6 +60,7 @@ pub struct Chapter {
     pub active_scene_id: Option<String>,
     pub memory_sync_status: String,
     pub arc_id: Option<String>,
+    pub scene_ids: Vec<String>,
 }
 
 fn read_chapter(row: &Row<'_>) -> rusqlite::Result<Chapter> {
@@ -72,6 +73,13 @@ fn read_chapter(row: &Row<'_>) -> rusqlite::Result<Chapter> {
         active_scene_id: row.get(5)?,
         memory_sync_status: row.get(6)?,
         arc_id: row.get(7)?,
+        scene_ids: serde_json::from_str(&row.get::<_, String>(8)?).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                8,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?,
     })
 }
 
@@ -87,6 +95,7 @@ pub struct Revision {
     pub content: String,
     pub cjk_char_count: i64,
     pub created_at: String,
+    pub scene_id: Option<String>,
 }
 
 fn read_revision(row: &Row<'_>) -> rusqlite::Result<Revision> {
@@ -100,6 +109,7 @@ fn read_revision(row: &Row<'_>) -> rusqlite::Result<Revision> {
         created_at: row.get(6)?,
         edit_level: row.get(7)?,
         content_hash: row.get(8)?,
+        scene_id: row.get(9)?,
     })
 }
 
@@ -238,13 +248,13 @@ impl Project {
                 |row| row.get(0),
             )
             .map_err(|_| StudioError::new(400, "这个文件不是有效的 StoryForge 工程"))?;
-        if !(1..=5).contains(&version) {
+        if !(1..=7).contains(&version) {
             return Err(StudioError::new(409, "工程版本与当前应用不兼容"));
         }
         conn.execute_batch(
             "PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;",
         )?;
-        if version < 5 {
+        if version < 7 {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let current: i64 =
                 tx.query_row("SELECT schema_version FROM project_meta LIMIT 1", [], |r| {
@@ -266,6 +276,14 @@ impl Project {
                 tx.execute_batch(include_str!("005_batch.sql"))?;
                 tx.execute("UPDATE project_meta SET schema_version=5", [])?;
             }
+            if current < 6 {
+                tx.execute_batch(include_str!("006_scene_workflow.sql"))?;
+                tx.execute("UPDATE project_meta SET schema_version=6", [])?;
+            }
+            if current < 7 {
+                tx.execute_batch(include_str!("007_hosting.sql"))?;
+                tx.execute("UPDATE project_meta SET schema_version=7", [])?;
+            }
             tx.commit()?;
         }
         let info = conn.query_row("SELECT project_id,title,target_beat_chars,target_chapter_chars FROM project_meta LIMIT 1", [], |r| {
@@ -277,7 +295,7 @@ impl Project {
 
     pub fn chapters(&self) -> Result<Vec<Chapter>> {
         let mut query = self.conn.prepare(
-            "SELECT chapter_id,title,chapter_order,current_revision_id,status,active_scene_id,memory_sync_status,arc_id FROM chapters
+            "SELECT chapter_id,title,chapter_order,current_revision_id,status,active_scene_id,memory_sync_status,arc_id,scene_ids_json FROM chapters
             WHERE status!='archived' ORDER BY chapter_order, chapter_id",
         )?;
         let rows = query
@@ -288,7 +306,7 @@ impl Project {
 
     pub fn archived_chapters(&self) -> Result<Vec<Chapter>> {
         let mut query = self.conn.prepare(
-            "SELECT chapter_id,title,chapter_order,current_revision_id,status,active_scene_id,memory_sync_status,arc_id FROM chapters
+            "SELECT chapter_id,title,chapter_order,current_revision_id,status,active_scene_id,memory_sync_status,arc_id,scene_ids_json FROM chapters
             WHERE status='archived' ORDER BY updated_at DESC",
         )?;
         let rows = query
@@ -351,6 +369,7 @@ impl Project {
             current_revision_id: None,
             status: "planned".into(),
             active_scene_id: None,
+            scene_ids: Vec::new(),
             memory_sync_status: "pending".into(),
             arc_id: None,
         })
@@ -428,7 +447,7 @@ impl Project {
     }
 
     pub fn revisions(&self, chapter_id: &str) -> Result<Vec<Revision>> {
-        let mut query = self.conn.prepare("SELECT revision_id,parent_revision_id,save_kind,source_tag,content,cjk_char_count,created_at,edit_level,content_hash
+        let mut query = self.conn.prepare("SELECT revision_id,parent_revision_id,save_kind,source_tag,content,cjk_char_count,created_at,edit_level,content_hash,scene_id
             FROM chapter_revisions WHERE chapter_id=?1 ORDER BY rowid DESC")?;
         let rows = query
             .query_map([chapter_id], read_revision)?
@@ -437,6 +456,14 @@ impl Project {
     }
 
     pub fn save_revision(&mut self, input: RevisionInput) -> Result<Revision> {
+        self.save_revision_with_canon(input, None)
+    }
+
+    pub fn save_revision_with_canon(
+        &mut self,
+        input: RevisionInput,
+        canon: Option<memory::Canon>,
+    ) -> Result<Revision> {
         if input.content.len() > 8_000_000 {
             return Err(StudioError::new(413, "单次保存的正文太长"));
         }
@@ -450,11 +477,17 @@ impl Project {
                 "章节已有更新，请查看最新修订后再保存",
             ));
         }
+        let mut scene_id: Option<String> = tx.query_row(
+            "SELECT active_scene_id FROM chapters WHERE chapter_id=?1",
+            [&input.chapter_id],
+            |row| row.get(0),
+        )?;
+        let mut approved_batch = None;
         let (save_kind, source_tag, content) = match input.source.as_str() {
             "manual_edit" => ("formal_revision", "manual_edit", input.content),
             "polish_diff" => ("formal_revision", "polish_diff", input.content),
             "auto_buffer" => {
-                let prior = tx.query_row("SELECT revision_id,parent_revision_id,save_kind,source_tag,content,cjk_char_count,created_at,edit_level,content_hash
+                let prior = tx.query_row("SELECT revision_id,parent_revision_id,save_kind,source_tag,content,cjk_char_count,created_at,edit_level,content_hash,scene_id
                     FROM chapter_revisions WHERE chapter_id=?1 AND parent_revision_id IS ?2 AND save_kind='auto_buffer' ORDER BY rowid DESC LIMIT 1",
                     params![input.chapter_id, base], read_revision).optional()?;
                 if let Some(prior) = prior.filter(|prior| prior.content == input.content) {
@@ -468,6 +501,9 @@ impl Project {
                     .as_deref()
                     .ok_or_else(|| StudioError::new(400, "缺少生成任务"))?;
                 let task = find_task(&tx, task_id)?;
+                if let Some(frozen_scene) = task.frozen_context.get("sceneBindingId") {
+                    scene_id = frozen_scene.as_str().map(str::to_owned);
+                }
                 if !matches!(
                     task.task_type.as_str(),
                     "beat_write" | "ab_write" | "batch_write"
@@ -495,6 +531,9 @@ impl Project {
                         append_drafts(String::new(), [carry, task.partial_output.as_str()]),
                     )
                 } else {
+                    if task.task_type == "batch_write" {
+                        approved_batch = Some(batch::approved_batch_draft(&tx, &task)?);
+                    }
                     let prior: String = match &base {
                         Some(revision) => tx.query_row(
                             "SELECT content FROM chapter_revisions WHERE revision_id=?1",
@@ -528,6 +567,12 @@ impl Project {
         } else {
             "semantic"
         };
+        if let Some(entry) = canon {
+            if save_kind != "formal_revision" || edit_level != "canon" || !input.canon_confirmed {
+                return Err(StudioError::new(409, "请先确认正史变更"));
+            }
+            memory::write_canon(&tx, entry)?;
+        }
         let revision = Revision {
             revision_id: id(),
             parent_revision_id: base,
@@ -538,11 +583,12 @@ impl Project {
             edit_level: edit_level.into(),
             content,
             created_at: now(),
+            scene_id,
         };
-        tx.execute("INSERT INTO chapter_revisions(revision_id,chapter_id,parent_revision_id,save_kind,source_tag,content,content_hash,cjk_char_count,created_at,edit_level)
-            VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+        tx.execute("INSERT INTO chapter_revisions(revision_id,chapter_id,parent_revision_id,save_kind,source_tag,content,content_hash,cjk_char_count,created_at,edit_level,scene_id)
+            VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
             params![revision.revision_id, input.chapter_id, revision.parent_revision_id, revision.save_kind, revision.source_tag,
-                revision.content, revision.content_hash, revision.cjk_char_count, revision.created_at,revision.edit_level])?;
+                revision.content, revision.content_hash, revision.cjk_char_count, revision.created_at,revision.edit_level,revision.scene_id])?;
         if save_kind == "formal_revision" {
             if let Some(parent) = revision.parent_revision_id.as_deref() {
                 editing::relink_evidence(&tx, parent, &revision, source_tag == "ai_gen")?;
@@ -551,9 +597,13 @@ impl Project {
                 memory_sync_status=CASE WHEN ?4='surface' AND memory_sync_status!='processing' THEN memory_sync_status ELSE 'pending' END,
                 updated_at=?2 WHERE chapter_id=?3",
                 params![revision.revision_id, revision.created_at, input.chapter_id,revision.edit_level])?;
-            if let Some(task_id) = input.draft_task_id.filter(|_| source_tag == "ai_gen") {
-                tx.execute("UPDATE batch_steps SET adopted_revision_id=?1 WHERE task_id=?2 AND settled_usd IS NULL",
-                    params![revision.revision_id,task_id])?;
+            if let Some(batch_id) = approved_batch {
+                tx.execute(
+                    "UPDATE batch_steps SET adopted_revision_id=?1 WHERE task_id=?2",
+                    params![revision.revision_id, input.draft_task_id],
+                )?;
+                tx.execute("UPDATE batch_runs SET phase='extract',audited_revision_id=?1,draft_task_id=NULL WHERE batch_id=?2",
+                    params![revision.revision_id,batch_id])?;
             }
         }
         tx.commit()?;
@@ -573,6 +623,7 @@ impl Project {
                     | "polish_span"
                     | "critic"
                     | "batch_write"
+                    | "inspiration"
             )
         {
             return Err(StudioError::new(400, "无效的节拍生成请求"));
@@ -878,6 +929,112 @@ mod tests {
             edit_level: None,
             canon_confirmed: false,
         }
+    }
+
+    #[test]
+    fn chapter_scene_history_and_canon_revision_are_persisted_atomically() {
+        let (dir, mut project, chapter) = project();
+        let one = project
+            .save_scene(catalog::SceneInput {
+                scene_id: None,
+                version: None,
+                title: "第一场".into(),
+                details: json!({}),
+            })
+            .unwrap();
+        let two = project
+            .save_scene(catalog::SceneInput {
+                scene_id: None,
+                version: None,
+                title: "第二场".into(),
+                details: json!({}),
+            })
+            .unwrap();
+        project
+            .link_scene(&chapter.chapter_id, Some(&one.scene_id))
+            .unwrap();
+        let first = project
+            .save_revision(save(&chapter, None, "她走进旧宅。", "manual_edit"))
+            .unwrap();
+        project
+            .link_scene(&chapter.chapter_id, Some(&two.scene_id))
+            .unwrap();
+        let mut canon = project
+            .save_canon(memory::Canon {
+                entry_id: String::new(),
+                version: 0,
+                category: "location".into(),
+                name: "旧宅".into(),
+                aliases: vec![],
+                body: "旧宅坐北朝南".into(),
+                locked: true,
+                audience: memory::Audience {
+                    scope: "public".into(),
+                    visible_to: vec![],
+                    observable_clue: String::new(),
+                    protected_terms: vec![],
+                },
+            })
+            .unwrap();
+        canon.body = "旧宅坐东朝西".into();
+        let mut change = save(
+            &chapter,
+            Some(first.revision_id.clone()),
+            "她走进旧宅。门朝西。",
+            "manual_edit",
+        );
+        change.edit_level = Some("canon".into());
+        assert_eq!(
+            project
+                .save_revision_with_canon(change, Some(canon.clone()))
+                .err()
+                .unwrap()
+                .status,
+            409
+        );
+        let mut change = save(
+            &chapter,
+            Some(first.revision_id.clone()),
+            "她走进旧宅。门朝西。",
+            "manual_edit",
+        );
+        change.edit_level = Some("canon".into());
+        change.canon_confirmed = true;
+        let second = project
+            .save_revision_with_canon(change, Some(canon.clone()))
+            .unwrap();
+        let mut stale = save(
+            &chapter,
+            Some(second.revision_id.clone()),
+            "她走进旧宅。门朝东。",
+            "manual_edit",
+        );
+        stale.edit_level = Some("canon".into());
+        stale.canon_confirmed = true;
+        assert_eq!(
+            project
+                .save_revision_with_canon(stale, Some(canon))
+                .err()
+                .unwrap()
+                .status,
+            409
+        );
+        assert_eq!(
+            current_revision(&project.conn, &chapter.chapter_id).unwrap(),
+            Some(second.revision_id.clone())
+        );
+        drop(project);
+        let reopened = Project::open(dir.path().join("长篇.story")).unwrap();
+        let saved_chapter = reopened.chapters().unwrap().remove(0);
+        assert_eq!(
+            saved_chapter.scene_ids,
+            vec![one.scene_id.clone(), two.scene_id.clone()]
+        );
+        let history = reopened.revisions(&chapter.chapter_id).unwrap();
+        assert_eq!(history[0].scene_id.as_deref(), Some(two.scene_id.as_str()));
+        assert_eq!(history[1].scene_id.as_deref(), Some(one.scene_id.as_str()));
+        let memory = serde_json::to_value(reopened.memory().unwrap()).unwrap();
+        assert_eq!(memory["canon"][0]["body"], "旧宅坐东朝西");
     }
 
     #[test]

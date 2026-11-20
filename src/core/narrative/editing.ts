@@ -33,12 +33,13 @@ export function polishContext(project: Project, chapter: Chapter, revision: Revi
   return { ...analysisContext(project, chapter, revision, profile, prompt), span }
 }
 
-export function criticContext(project: Project, chapter: Chapter, revision: Revision, profile: ModelProfile) {
-  return analysisContext(project, chapter, revision, profile, [
+export function criticContext(project: Project, chapter: Chapter, revision: Revision, profile: ModelProfile, span?: EditSpan) {
+  const context = analysisContext(project, chapter, revision, profile, [
     '你是中文小说主编。评估人物能动性、表层行为和潜台词、节奏、对话区分度、情感积累及套话。只给有原文证据的建议，保留作者选择和文字。',
     '仅返回 JSON {"findings":[]}。每项为 severity(severe/notice)、message、suggestion、quote、occurrence。quote 为逐字原文，最长 120 字。重复时写第几次 occurrence，从 1 起。',
-    '正文：\n' + revision.content,
+    (span ? '所选正文（重复引文仅在选区内计数）：\n' : '正文：\n') + (span?.expected ?? revision.content),
   ].join('\n\n'))
+  return { ...context, span }
 }
 
 export function parseReplacement(output: string) {

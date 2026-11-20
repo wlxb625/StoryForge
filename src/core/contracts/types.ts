@@ -1,4 +1,5 @@
 import type { EditLevel, EditSpan } from '../narrative/editing'
+import type { SceneReview, ViewpointRange } from '../narrative/scenes'
 
 export type TaskState =
   | 'created' | 'queued' | 'running' | 'streaming' | 'completed'
@@ -62,6 +63,7 @@ export interface Chapter {
   currentRevisionId: string | null
   status: string
   activeSceneId?: string | null
+  sceneIds?: string[]
   memorySyncStatus?: 'pending' | 'processing' | 'synced' | 'needs_confirm'
   arcId?: string | null
 }
@@ -76,6 +78,7 @@ export interface Revision {
   createdAt: string
   editLevel?: EditLevel
   contentHash?: string
+  sceneId?: string | null
 }
 
 export interface RevisionInput {
@@ -107,6 +110,14 @@ export interface FrozenContext {
   prompt: string
   requestBody: Record<string, unknown>
   scene?: Scene
+  sceneBindingId?: string | null
+  sceneBindingVersion?: number
+  stagedDraftId?: string
+  sceneReview?: SceneReview
+  viewpoints?: ViewpointRange[]
+  viewpointAlerts?: { severity: 'severe'; message: string; suggestion: string; anchor: { quote: string; startOffset: number; endOffset: number } }[]
+  memoryEvidence?: { eventId: string; chapterId: string; chapterOrder: number; revisionId: string; anchor: { quote: string; startOffset: number; endOffset: number }; summary: string }[]
+  cartridgeStage?: string
   intent?: SceneIntent
   promptRevisionId?: string | null
   activeSkills?: Array<{ id: string; name: string; version: string }>
@@ -120,7 +131,7 @@ export interface TaskInput {
   idempotencyKey: string
   chapterId: string
   baseRevisionId: string | null
-  taskType: 'beat_write' | 'ab_write' | 'skill_extract' | 'memory_extract' | 'consistency_check' | 'polish_span' | 'critic' | 'batch_write'
+  taskType: 'beat_write' | 'ab_write' | 'skill_extract' | 'memory_extract' | 'consistency_check' | 'polish_span' | 'critic' | 'batch_write' | 'inspiration'
   frozenContext: FrozenContext
 }
 
@@ -178,6 +189,8 @@ export interface SceneDetails {
   intent?: Partial<SceneIntent>
   techniqueIds?: string[]
   povCharacterId?: string
+  requiresPreviousMemory?: boolean
+  cartridgeStage?: { packId: string; stage: string }
 }
 export interface Scene { sceneId: string; title: string; version: number; details: SceneDetails }
 export type SceneInput = Partial<Pick<Scene, 'sceneId' | 'version'>> & Pick<Scene, 'title' | 'details'>

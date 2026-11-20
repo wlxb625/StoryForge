@@ -4,9 +4,11 @@ import { Beaker, Check, RotateCw } from 'lucide-vue-next'
 import { activeTask, type Trace } from '../core/contracts/types'
 import { estimate } from '../core/providers/pricing'
 import { useStudio } from '../stores/studio'
+import WritingContext from '../components/WritingContext.vue'
 
 const studio = useStudio()
-const tab = ref<'prompt' | 'usage' | 'compare'>('prompt')
+const emit = defineEmits<{ settings: []; open: [chapterId: string, quote: string, offset: number] }>()
+const tab = ref<'prompt' | 'usage' | 'compare' | 'capabilities'>('prompt')
 const taskId = ref('')
 const selectedTask = computed(() => studio.tasks.find(task => task.taskId === taskId.value) ?? studio.tasks[0])
 const override = ref(studio.promptHistory[0]?.instruction ?? '')
@@ -21,6 +23,11 @@ const sides = computed(() => studio.tasks.filter(task => task.frozenContext.comp
   .sort((a, b) => (a.frozenContext.comparison?.label ?? '').localeCompare(b.frozenContext.comparison?.label ?? '')))
 const date = new Intl.DateTimeFormat('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
 const token = (value: number | null) => value == null ? '未知' : value.toLocaleString('zh-CN')
+const capabilities = {
+  streaming: '流式', jsonMode: 'JSON 模式', usage: 'Token 用量', cancel: '取消',
+  contextLen: '上下文长度', promptCache: '提示词缓存', multimodal: '多模态',
+} as const
+const verification = { verified_supported: '实测支持', verified_unsupported: '实测不支持', declared: '已声明', unknown: '未知' }
 
 function cost(trace: Trace) {
   const context = studio.tasks.find(task => task.taskId === trace.taskId)?.frozenContext
@@ -49,10 +56,11 @@ onMounted(() => { void studio.refreshTraces().catch(() => { studio.error = '无�
       <button class="flat-button" :class="{ selected: tab === 'prompt' }" type="button" @click="tab = 'prompt'">提示词</button>
       <button class="flat-button" :class="{ selected: tab === 'usage' }" type="button" @click="tab = 'usage'">用量账单</button>
       <button class="flat-button" :class="{ selected: tab === 'compare' }" type="button" @click="tab = 'compare'">A/B 盲测</button>
+      <button class="flat-button" :class="{ selected: tab === 'capabilities' }" type="button" @click="tab = 'capabilities'">模型能力</button>
     </nav>
     <div v-if="tab === 'prompt'" class="lab-columns">
       <article class="lab-card">
-        <h2>实际发送的提示词</h2>
+        <h2>请求提示词</h2>
         <select v-if="studio.tasks.length" v-model="taskId" aria-label="历史生成任务">
           <option disabled value="">最近任务</option>
           <option v-for="task in studio.tasks" :key="task.taskId" :value="task.taskId">
@@ -61,6 +69,7 @@ onMounted(() => { void studio.refreshTraces().catch(() => { studio.error = '无�
         </select>
         <template v-if="selectedTask">
           <p class="muted">{{ selectedTask.frozenContext.model }} · {{ selectedTask.state }}</p>
+          <WritingContext :key="selectedTask.taskId" :context="selectedTask.frozenContext" @open="(...args) => emit('open', ...args)" />
           <pre class="plain-text frozen-prompt">{{ selectedTask.frozenContext.prompt }}</pre>
           <button class="secondary-button" type="button" @click="copy(selectedTask.frozenContext.prompt)">复制 Prompt</button>
           <details><summary>冻结快照</summary><pre class="plain-text">{{ JSON.stringify(selectedTask.frozenContext, null, 2) }}</pre></details>
@@ -91,6 +100,17 @@ onMounted(() => { void studio.refreshTraces().catch(() => { studio.error = '无�
         </tr></tbody>
       </table>
       <p v-else class="muted">还没有模型调用。</p>
+    </div>
+    <div v-else-if="tab === 'capabilities'" class="lab-card usage-ledger">
+      <div class="workspace-actions"><h2>模型能力</h2>
+        <button class="secondary-button" type="button" @click="emit('settings')">配置与实测</button></div>
+      <table v-if="studio.profiles.length">
+        <thead><tr><th>模型</th><th v-for="(label, key) in capabilities" :key="key">{{ label }}</th></tr></thead>
+        <tbody><tr v-for="profile in studio.profiles" :key="profile.id">
+          <td>{{ profile.name }}</td><td v-for="(_, key) in capabilities" :key="key">{{ verification[profile.capabilities[key] ?? 'unknown'] }}</td>
+        </tr></tbody>
+      </table>
+      <p v-else class="muted">配置模型后可运行接口实测。</p>
     </div>
     <template v-else>
       <div class="lab-card ab-control">

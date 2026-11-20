@@ -6,11 +6,19 @@ const talk = /谈判|对白|对话|试探|交涉|质问|对峙/
 const doubt = /悬疑|查证|调查|疑案|秘密|线索|反常/
 const playful = /喜剧|包袱|轻松|玩笑|诙谐|窘态/
 
-export function deriveIntent(scene: Scene | undefined, instruction: string, recent = ''): SceneIntent {
+export function repeatedActions(recent: string) {
+  const counts = new Map<string, number>()
+  for (const match of recent.slice(-700).matchAll(/攥紧(?:拳头|拳)?|皱了皱眉|别过脸|摇了摇头|沉默片刻|倒吸一口气|嘴角抽了抽|心头一紧/g)) {
+    counts.set(match[0], (counts.get(match[0]) ?? 0) + 1)
+  }
+  return [...counts].filter(([, count]) => count > 1).map(([action]) => action)
+}
+
+export function deriveIntent(scene: Scene | undefined, instruction: string, recent = '', direction = ''): SceneIntent {
   const context = [instruction, scene?.title, scene?.details.conflict].filter(Boolean).join(' ')
-  const signal = context || recent.slice(-500)
+  const signal = context || [direction, recent.slice(-500)].filter(Boolean).join(' ')
   const inferred: SceneIntent = {
-    goal: instruction.trim() || scene?.details.conflict || '完成一次能被下一拍承接的叙事推进',
+    goal: instruction.trim() || scene?.details.conflict || direction.split('\n')[0] || '完成一次能被下一拍承接的叙事推进',
     hiddenGoal: doubt.test(signal) ? '让人物发现可核对的异常，暂缓作出定论' : '',
     action: scene?.details.conflict || '接续最后一个行动，展示具体结果',
     emotion: grief.test(signal) ? '悲伤、克制' : doubt.test(signal) ? '谨慎、紧绷' : playful.test(signal) ? '轻松' : '延续前情',

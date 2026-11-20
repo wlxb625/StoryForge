@@ -1,16 +1,22 @@
 <script setup lang="ts">
-import { computed, ref, toRaw } from 'vue'
+import { computed, ref, toRaw, watch } from 'vue'
 import MarkdownIt from 'markdown-it'
 import { Binoculars, Download, Pause, Play, Square } from 'lucide-vue-next'
 import type { Canon } from '../core/narrative/memory'
 import { eventTypes } from '../core/narrative/memory'
 import { useStudio } from '../stores/studio'
+import { desktop } from '../core/db/desktop'
+import { auditFindings } from '../core/narrative/memory'
+import type { Batch, BatchDraft, BatchSummary } from '../core/tasks/batch'
+import BatchFlow from '../components/BatchFlow.vue'
 
-const emit = defineEmits<{ open: [chapterId: string, quote: string, offset?: number]; review: [chapterId: string] }>()
+const options = defineProps<{ openBatch?: boolean }>()
+const emit = defineEmits<{ open: [chapterId: string, quote: string, offset?: number]; review: [chapterId: string]; memory: [] }>()
 const studio = useStudio()
 const markdown = new MarkdownIt({ html: false, linkify: false }).disable(['link','image','autolink'])
-const tabs = { people: '人物状态', props: '道具账本', timeline: '时间线', relations: '人物关系', hooks: '伏笔与回旋', batch: '后台连写' } as const
-const tab = ref<keyof typeof tabs>('people')
+const tabs = { people: '人物状态', props: '道具账本', timeline: '时间线', relations: '人物关系', hooks: '伏笔与回旋', batch: '托管控制台' } as const
+const tab = ref<keyof typeof tabs>(options.openBatch ? 'batch' : 'people')
+watch(() => options.openBatch, open => { if (open) tab.value = 'batch' })
 const people = computed(() => studio.memory.canon.filter(item => item.category === 'character'))
 const character = ref<Canon>()
 const draft = ref('')
@@ -57,10 +63,47 @@ const edges = computed(() => {
 const hookStatus = { open: '待回收', reminded: '已提醒', paid_off: '已回收', deprecated: '已废弃' } as const
 const hookType = { foreshadow: '伏笔', gag_hook: '包袱回旋', subtext_cue: '潜台词' }
 const batchStates = { running: '正在连写', paused: '已暂停', stopped: '已结束', completed: '已完成' }
-const phases = { write: '写作', audit: '一致性审查', extract: '证据提取', advance: '确认记忆' }
+const savedRuns = ref<BatchSummary[]>([])
+const historyId = ref('')
+const historicalRun = ref<Batch>()
+const dateTime = new Intl.DateTimeFormat('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })
+watch(() => [tab.value, studio.batch?.batchId, studio.batch?.state], async ([tab], _, onCleanup) => {
+  if (tab !== 'batch') return
+  let stale = false
+  onCleanup(() => { stale = true })
+  try {
+    const rows = await desktop.batchHistory()
+    if (!stale) savedRuns.value = rows
+  } catch { if (!stale) studio.error = '无法读取托管历史。' }
+}, { immediate: true })
+watch(historyId, async (id, _, onCleanup) => {
+  historicalRun.value = undefined
+  if (!id) return
+  let stale = false
+  onCleanup(() => { stale = true })
+  try {
+    const run = await desktop.namedBatch(id)
+    if (!stale) historicalRun.value = run
+  } catch { if (!stale) studio.error = '无法读取所选批次。' }
+})
+const stagedDraft = ref<BatchDraft | null>(null)
+watch(() => [studio.batch?.batchId, studio.batch?.draftTaskId] as const, async ([batchId, draftId]) => {
+  const draft = batchId && draftId ? await desktop.previewBatchDraft(batchId).catch(() => null) : null
+  if (studio.batch?.draftTaskId === draftId) stagedDraft.value = draft
+}, { immediate: true })
+const stagedFindings = computed(() => {
+  const draft = stagedDraft.value
+  if (!draft) return []
+  const review = studio.tasks.find(task => task.state === 'completed' && task.taskType === 'consistency_check'
+    && task.frozenContext.stagedDraftId === draft.taskId)
+  const local = review?.frozenContext.viewpointAlerts ?? []
+  try { return review ? [...local, ...auditFindings(review.partialOutput, draft.content)] : [] }
+  catch { return local }
+})
 const chapterIds = ref<string[]>(studio.chapterId ? [studio.chapterId] : [])
 const budget = ref(studio.batch?.budgetUsd ?? 0.02)
 const instruction = ref('')
+const mode = ref<Batch['mode']>('assisted')
 const picks = computed(() => studio.profiles.filter(profile => profile.rates && (!profile.needsKey || profile.hasKey)))
 const writer = ref(picks.value.find(profile => profile.id === studio.profileId)?.id ?? picks.value[0]?.id ?? '')
 const audit = ref(studio.memory.roles.auditProfileId ?? writer.value)
@@ -84,15 +127,19 @@ function edit(person: Canon) {
 async function save() {
   if (!character.value) return
   await studio.saveCanon({ ...character.value, body: draft.value })
-  if (!studio.error) {
+  if (!studio.error && !studio.canonProposal) {
     const updated = studio.memory.canon.find(item => item.entryId === character.value?.entryId)
     if (updated) edit(updated)
   }
 }
+watch(() => people.value.find(item => item.entryId === character.value?.entryId)?.version, version => {
+  const updated = people.value.find(item => item.entryId === character.value?.entryId)
+  if (updated && version !== character.value?.version) edit(updated)
+})
 function start() {
   if (!confirmed.value) return
   void studio.startBatch({ chapterIds: chapterIds.value, budgetUsd: budget.value, instruction: instruction.value,
-    writerProfile: writer.value, auditProfile: audit.value, extractionProfile: extractor.value })
+    writerProfile: writer.value, auditProfile: audit.value, extractionProfile: extractor.value, mode: mode.value })
 }
 </script>
 
@@ -101,6 +148,7 @@ function start() {
     <header class="workspace-intro panorama-heading">
       <h1><Binoculars :size="26" /> 全景</h1>
       <div class="memory-actions">
+        <button class="secondary-button" type="button" @click="emit('memory')">记忆库 <span v-if="studio.memoryPending">{{ studio.memoryPending }}</span></button>
         <select v-model="exportFormat" aria-label="导出格式">
           <option value="story">工程快照 .story</option><option value="docx">成稿 .docx</option><option value="epub">电子书 .epub</option>
         </select>
@@ -120,7 +168,9 @@ function start() {
       <form v-if="character" class="workspace-field memory-form" @submit.prevent="save">
         <h2>{{ character.name }}</h2>
         <label>人物状态 Markdown<textarea v-model="draft" rows="7"></textarea></label>
-        <button type="submit" class="primary-button" :disabled="studio.busy || draft === character.body">保存人物状态</button>
+        <label class="check-line"><input v-model="character.locked" type="checkbox"> 锁定为作者权威设定</label>
+        <button type="submit" class="primary-button" :disabled="studio.busy || (draft === character.body
+          && character.locked === people.find(person => person.entryId === character?.entryId)?.locked)">保存人物状态</button>
         <article v-if="draft" class="rendered-card" v-html="cardHtml"></article>
       </form>
     </div>
@@ -163,7 +213,19 @@ function start() {
         </article>
       </section>
     </div>
-    <div v-else class="memory-grid">
+    <div v-else class="hosting-grid">
+      <section v-if="studio.batch" class="workspace-field memory-form hosting-flow">
+        <label v-if="savedRuns.length > 1">托管批次
+          <select v-model="historyId">
+            <option value="">当前或最近一次</option>
+            <option v-for="run in savedRuns.filter(item => item.batchId !== studio.batch?.batchId)" :key="run.batchId" :value="run.batchId">
+              {{ dateTime.format(new Date(run.createdAt)) }} · {{ run.mode === 'assisted' ? '辅助托管' : '全自动托管' }} · {{ batchStates[run.state] }}
+            </option>
+          </select>
+        </label>
+        <BatchFlow v-if="!historyId || historicalRun" :run="historicalRun ?? studio.batch" @open="(...args) => emit('open', ...args)" />
+        <p v-if="historicalRun?.reason" class="muted">{{ historicalRun.reason }}</p>
+      </section>
       <section v-if="studio.batch" class="workspace-field memory-form batch-status">
         <h2>{{ batchStates[studio.batch.state] }}</h2>
         <p>{{ studio.batch.cursor }} / {{ studio.batch.chapterIds.length }} 章</p>
@@ -172,21 +234,39 @@ function start() {
         </div>
         <dl><dt>已记账 / 预算</dt><dd>{{ usd(studio.batch.spentUsd) }} / {{ usd(studio.batch.budgetUsd) }}</dd>
           <dt v-if="studio.batch.step">请求预留</dt><dd v-if="studio.batch.step">{{ usd(studio.batch.step.reservedUsd) }}</dd>
-          <dt v-if="studio.batch.estimatedSteps">含估算的步骤</dt><dd v-if="studio.batch.estimatedSteps">{{ studio.batch.estimatedSteps }}</dd>
-          <dt v-if="live">当前步骤</dt><dd v-if="live">{{ phases[studio.batch.phase] }}</dd></dl>
+          <dt v-if="studio.batch.estimatedSteps">含估算的步骤</dt><dd v-if="studio.batch.estimatedSteps">{{ studio.batch.estimatedSteps }}</dd></dl>
         <p v-if="studio.batch.reason" :class="studio.batch.state === 'paused' ? 'pending-text' : 'muted'">{{ studio.batch.reason }}</p>
+        <article v-for="finding in stagedFindings" :key="finding.anchor.startOffset + finding.message"
+          class="review-finding" :class="{ severe: finding.severity === 'severe' }">
+          <strong>{{ finding.message }}</strong><blockquote>{{ finding.anchor.quote }}</blockquote><p>{{ finding.suggestion }}</p>
+        </article>
+        <details v-if="stagedDraft" :open="studio.batch.phase === 'approval'">
+          <summary>待审查的暂存稿</summary><p class="saved-batch-draft">{{ stagedDraft.appendix }}</p>
+        </details>
         <button v-if="live && studio.batch.chapterIds[studio.batch.cursor]" type="button" class="flat-button"
           @click="emit('review', studio.batch.chapterIds[studio.batch.cursor]!)">查看当前章审查</button>
+        <button v-if="studio.batch.state === 'paused' && studio.batch.phase === 'advance'" type="button" class="flat-button"
+          @click="emit('memory')">进入记忆库确认候选</button>
         <label v-if="studio.batch.state === 'paused'">继续使用的预算（美元）<input v-model.number="budget" type="number" min="0.000001" step="0.000001"></label>
         <div v-if="live" class="memory-actions">
           <button v-if="studio.batch.state === 'running'" class="secondary-button" type="button" @click="studio.controlBatch('pause')"><Pause :size="16" /> 暂停</button>
+          <button v-else-if="studio.batch.phase === 'approval'" class="primary-button" type="button"
+            @click="studio.controlBatch('approve', budget)"><Play :size="16" /> 采纳本章并继续</button>
           <button v-else class="primary-button" type="button" @click="studio.controlBatch('resume', budget)"><Play :size="16" /> 确认继续</button>
+          <button v-if="studio.batch.state === 'paused' && studio.batch.draftTaskId && !studio.batch.step" class="flat-button" type="button"
+            @click="studio.controlBatch('reset_draft')">归档暂存稿并重新起草</button>
+          <button v-if="studio.batch.state === 'paused' && ['audit','approval','adopt'].includes(studio.batch.phase) && studio.batch.draftTaskId && !studio.batch.step"
+            class="flat-button" type="button" @click="studio.controlBatch('reaudit')">重新审查暂存稿</button>
           <button class="flat-button" type="button" @click="studio.controlBatch('stop')"><Square :size="15" /> 结束批次</button>
         </div>
         <details v-for="task in queueTasks" :key="task.taskId"><summary>保留的后台草稿</summary><p class="saved-batch-draft">{{ task.partialOutput }}</p></details>
       </section>
       <form v-if="!live" class="workspace-field memory-form" @submit.prevent="start">
-        <h2>新建后台连写</h2>
+        <h2>新建托管</h2>
+        <label>托管方式<select v-model="mode">
+          <option value="assisted">辅助托管 · 审查后逐章确认</option>
+          <option value="automatic">全自动托管 · 审查通过后自动采纳</option>
+        </select></label>
         <fieldset class="audience-fields batch-chapters"><legend>章节</legend>
           <label v-for="chapter in studio.chapters" :key="chapter.chapterId" class="check-line">
             <input v-model="chapterIds" type="checkbox" :value="chapter.chapterId">{{ chapter.chapterOrder }}　{{ chapter.title }}
@@ -200,8 +280,8 @@ function start() {
         <label>证据提取<select v-model="extractor" required><option disabled value="">选择模型</option>
           <option v-for="profile in picks" :key="profile.id" :value="profile.id">{{ profile.name }}</option></select></label>
         <label>写作要求<textarea v-model="instruction" rows="3" maxlength="1200"></textarea></label>
-        <label class="check-line"><input v-model="confirmed" type="checkbox" required>允许在所选章节自动保存通过技术检查的节拍</label>
-        <button class="primary-button" type="submit" :disabled="studio.busy || !picks.length || !chapterIds.length">启动后台连写</button>
+        <label class="check-line"><input v-model="confirmed" type="checkbox" required>{{ mode === 'assisted' ? '按所选范围和预算开始起草，每章由我确认后入稿' : '允许审查通过的正文自动入稿，遇异常暂停' }}</label>
+        <button class="primary-button" type="submit" :disabled="studio.busy || !picks.length || !chapterIds.length">启动托管</button>
         <p v-if="!picks.length" class="muted">在模型设置填写单价后即可使用。</p>
       </form>
     </div>

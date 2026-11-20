@@ -86,6 +86,20 @@ export function serializeSkill(pack: Pack) {
   }) + '---\n' + pack.body + '\n'
 }
 
+export function serializePack(pack: Pack) {
+  if (pack.slot !== 'cartridge') {
+    const contents = serializeSkill(pack)
+    parseSkill(contents)
+    return { name: pack.itemId + '.md', contents }
+  }
+  const contents = JSON.stringify({
+    id: pack.itemId, name: pack.name, version: pack.version, description: pack.metadata.description ?? pack.body,
+    stages: pack.metadata.stages ?? [], preferred_skills: pack.metadata.preferredSkills ?? [],
+  }, null, 2) + '\n'
+  parseCartridge(contents)
+  return { name: pack.itemId + '.json', contents }
+}
+
 export function unwrapSkillDraft(text: string) {
   const trimmed = text.trim()
   return /^```(?:markdown|md)?\s*\n([\s\S]+?)\n```$/i.exec(trimmed)?.[1] ?? trimmed

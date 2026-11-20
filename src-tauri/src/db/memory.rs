@@ -67,6 +67,7 @@ pub struct Candidate {
 pub struct Fact {
     event_id: String,
     source_revision_id: String,
+    active_revision_id: Option<String>,
     chapter_id: String,
     chapter_order: i64,
     event_type: String,
@@ -107,6 +108,8 @@ pub struct Note {
     pub body: String,
     pub audience: Audience,
     pub status: String,
+    #[serde(default)]
+    pub remind_after_chapters: Option<i64>,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -125,7 +128,7 @@ pub struct Memory {
     notes: Vec<Note>,
     roles: MemoryRoles,
     ingested: Vec<(String, String)>,
-    stamp: String,
+    pub(super) stamp: String,
 }
 
 #[derive(Serialize)]
@@ -233,7 +236,7 @@ fn read_canon(db: &Connection) -> Result<Vec<Canon>> {
 fn read_facts(db: &Connection) -> Result<Vec<Fact>> {
     let mut query = db.prepare("SELECT e.event_id,e.source_revision_id,c.chapter_id,c.chapter_order,e.event_type,
         e.subject_ids_json,e.summary,e.world_time_label,COALESCE(e.active_anchor_json,e.evidence_anchor_json),e.approval_status,e.confidence,e.payload_json,
-        COALESCE(c.current_revision_id=e.active_revision_id,0) AND c.status!='archived'
+        COALESCE(c.current_revision_id=e.active_revision_id,0) AND c.status!='archived',e.active_revision_id
         FROM story_events e JOIN chapter_revisions r ON r.revision_id=e.source_revision_id
         JOIN chapters c ON c.chapter_id=r.chapter_id ORDER BY c.chapter_order,e.created_at,e.rowid")?;
     let mut rows = query.query([])?;
@@ -243,6 +246,7 @@ fn read_facts(db: &Connection) -> Result<Vec<Fact>> {
         facts.push(Fact {
             event_id: row.get(0)?,
             source_revision_id: row.get(1)?,
+            active_revision_id: row.get(13)?,
             chapter_id: row.get(2)?,
             chapter_order: row.get(3)?,
             event_type: row.get(4)?,
@@ -262,7 +266,11 @@ fn read_facts(db: &Connection) -> Result<Vec<Fact>> {
 
 impl Project {
     pub fn memory(&self) -> Result<Memory> {
-        let mut knowledge_query = self.conn.prepare("SELECT k.character_id,k.target_event_id,k.epistemic_state,k.knowledge_source,
+        Self::read_memory(&self.conn)
+    }
+
+    pub(super) fn read_memory(conn: &Connection) -> Result<Memory> {
+        let mut knowledge_query = conn.prepare("SELECT k.character_id,k.target_event_id,k.epistemic_state,k.knowledge_source,
             k.known_since_revision_id,c.chapter_order,k.perception,k.observable_clues FROM character_knowledge k
             JOIN chapter_revisions r ON r.revision_id=k.known_since_revision_id
             JOIN chapters c ON c.chapter_id=r.chapter_id WHERE c.status!='archived' ORDER BY k.knowledge_id")?;
@@ -280,8 +288,8 @@ impl Project {
                 })
             })?
             .collect::<rusqlite::Result<_>>()?;
-        let mut note_query = self.conn.prepare("SELECT n.note_id,n.note_type,n.source_revision_id,c.chapter_order,n.related_ids_json,
-            n.content,n.audience_scope,n.visible_to_json,n.status FROM soft_notes n
+        let mut note_query = conn.prepare("SELECT n.note_id,n.note_type,n.source_revision_id,c.chapter_order,n.related_ids_json,
+            n.content,n.audience_scope,n.visible_to_json,n.status,n.remind_after_chapters FROM soft_notes n
             JOIN chapter_revisions r ON r.revision_id=n.source_revision_id
             JOIN chapters c ON c.chapter_id=r.chapter_id WHERE c.status!='archived' ORDER BY n.created_at,n.rowid")?;
         let mut rows = note_query.query([])?;
@@ -307,9 +315,10 @@ impl Project {
                 body: r.get(5)?,
                 audience,
                 status: r.get(8)?,
+                remind_after_chapters: r.get(9)?,
             });
         }
-        let roles = self.conn.query_row(
+        let roles = conn.query_row(
             "SELECT audit_profile_id,extraction_profile_id FROM project_meta",
             [],
             |r| {
@@ -319,14 +328,12 @@ impl Project {
                 })
             },
         )?;
-        let mut ingest = self
-            .conn
-            .prepare("SELECT task_id,problem FROM memory_ingest")?;
+        let mut ingest = conn.prepare("SELECT task_id,problem FROM memory_ingest")?;
         let ingested = ingest
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<rusqlite::Result<_>>()?;
-        let canon = read_canon(&self.conn)?;
-        let events = read_facts(&self.conn)?;
+        let canon = read_canon(conn)?;
+        let events = read_facts(conn)?;
         let stamp = if canon.is_empty() && events.is_empty() && notes.is_empty() {
             String::new()
         } else {
@@ -348,7 +355,7 @@ impl Project {
     pub fn check_writer_stamp(&self, task: &super::Task) -> Result<()> {
         if matches!(
             task.task_type.as_str(),
-            "beat_write" | "ab_write" | "batch_write"
+            "beat_write" | "ab_write" | "batch_write" | "inspiration"
         ) && task.frozen_context["memoryStamp"]
             .as_str()
             .unwrap_or_default()
@@ -362,47 +369,54 @@ impl Project {
         Ok(())
     }
 
-    pub fn save_canon(&mut self, mut entry: Canon) -> Result<Canon> {
-        entry.name = entry.name.trim().into();
-        if !matches!(
-            entry.category.as_str(),
-            "character" | "prop" | "location" | "world_rule"
-        ) || entry.name.is_empty()
-            || entry.name.chars().count() > 120
-            || entry.body.len() > 40_000
-            || entry.aliases.len() > 40
-            || entry
-                .aliases
-                .iter()
-                .any(|alias| alias.trim().is_empty() || alias.len() > 360)
-        {
-            return Err(invalid("请检查设定名称、类别和内容长度"));
-        }
+    pub fn save_canon(&mut self, entry: Canon) -> Result<Canon> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        validate_audience(&tx, &entry.audience)?;
-        let attributes = json!({ "body": entry.body, "audience": entry.audience }).to_string();
-        let aliases = serde_json::to_string(&entry.aliases)?;
-        if entry.entry_id.is_empty() {
-            entry.entry_id = id();
-            entry.version = 1;
-            tx.execute("INSERT INTO canon_entries(entry_id,category,name,aliases_json,attributes_json,is_locked,version,updated_at)
-                VALUES(?1,?2,?3,?4,?5,?6,1,?7)",
-                params![entry.entry_id,entry.category,entry.name,aliases,attributes,entry.locked,now()])?;
-        } else {
-            let changed = tx.execute("UPDATE canon_entries SET name=?1,aliases_json=?2,attributes_json=?3,is_locked=?4,version=version+1,updated_at=?5
-                WHERE entry_id=?6 AND version=?7 AND category=?8",
-                params![entry.name,aliases,attributes,entry.locked,now(),entry.entry_id,entry.version,entry.category])?;
-            if changed == 0 {
-                return Err(StudioError::new(409, "设定版本已变化，请重读后编辑"));
-            }
-            entry.version += 1;
-        }
+        let entry = write_canon(&tx, entry)?;
         tx.commit()?;
         Ok(entry)
     }
+}
 
+pub(super) fn write_canon(db: &Connection, mut entry: Canon) -> Result<Canon> {
+    entry.name = entry.name.trim().into();
+    if !matches!(
+        entry.category.as_str(),
+        "character" | "prop" | "location" | "world_rule"
+    ) || entry.name.is_empty()
+        || entry.name.chars().count() > 120
+        || entry.body.len() > 40_000
+        || entry.aliases.len() > 40
+        || entry
+            .aliases
+            .iter()
+            .any(|alias| alias.trim().is_empty() || alias.len() > 360)
+    {
+        return Err(invalid("请检查设定名称、类别和内容长度"));
+    }
+    validate_audience(db, &entry.audience)?;
+    let attributes = json!({ "body": entry.body, "audience": entry.audience }).to_string();
+    let aliases = serde_json::to_string(&entry.aliases)?;
+    if entry.entry_id.is_empty() {
+        entry.entry_id = id();
+        entry.version = 1;
+        db.execute("INSERT INTO canon_entries(entry_id,category,name,aliases_json,attributes_json,is_locked,version,updated_at)
+                VALUES(?1,?2,?3,?4,?5,?6,1,?7)",
+                params![entry.entry_id,entry.category,entry.name,aliases,attributes,entry.locked,now()])?;
+    } else {
+        let changed = db.execute("UPDATE canon_entries SET name=?1,aliases_json=?2,attributes_json=?3,is_locked=?4,version=version+1,updated_at=?5
+                WHERE entry_id=?6 AND version=?7 AND category=?8",
+                params![entry.name,aliases,attributes,entry.locked,now(),entry.entry_id,entry.version,entry.category])?;
+        if changed == 0 {
+            return Err(StudioError::new(409, "设定版本已变化，请重读后编辑"));
+        }
+        entry.version += 1;
+    }
+    Ok(entry)
+}
+
+impl Project {
     pub fn save_memory_roles(&self, roles: MemoryRoles) -> Result<()> {
         self.conn.execute(
             "UPDATE project_meta SET audit_profile_id=?1,extraction_profile_id=?2",
@@ -422,6 +436,9 @@ impl Project {
         ) || note.body.trim().is_empty()
             || note.body.len() > 20_000
             || note.related_ids.len() > 60
+            || note
+                .remind_after_chapters
+                .is_some_and(|count| !(1..=1000).contains(&count))
         {
             return Err(invalid("请检查备注类型、状态及正文"));
         }
@@ -435,12 +452,12 @@ impl Project {
         if note.note_id.is_empty() {
             note.note_id = id();
         }
-        self.conn.execute("INSERT INTO soft_notes(note_id,note_type,related_ids_json,content,audience_scope,visible_to_json,source_revision_id,status,created_at)
-            VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9) ON CONFLICT(note_id) DO UPDATE SET note_type=excluded.note_type,
+        self.conn.execute("INSERT INTO soft_notes(note_id,note_type,related_ids_json,content,audience_scope,visible_to_json,source_revision_id,status,created_at,remind_after_chapters)
+            VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10) ON CONFLICT(note_id) DO UPDATE SET note_type=excluded.note_type,
             related_ids_json=excluded.related_ids_json,content=excluded.content,audience_scope=excluded.audience_scope,
-            visible_to_json=excluded.visible_to_json,source_revision_id=excluded.source_revision_id,status=excluded.status",
+            visible_to_json=excluded.visible_to_json,source_revision_id=excluded.source_revision_id,status=excluded.status,remind_after_chapters=excluded.remind_after_chapters",
             params![note.note_id,note.note_type,serde_json::to_string(&note.related_ids)?,note.body,note.audience.scope,
-                serde_json::to_string(&note.audience)?,note.source_revision_id,note.status,now()])?;
+                serde_json::to_string(&note.audience)?,note.source_revision_id,note.status,now(),note.remind_after_chapters])?;
         Ok(())
     }
 
@@ -505,6 +522,7 @@ impl Project {
             WHERE r.revision_id=?1 AND c.chapter_id=?2 AND r.save_kind='formal_revision'",
             params![revision,task.chapter_id], |r| Ok((r.get(0)?,r.get(1)?)))?;
         let manuscript: Vec<u16> = source.encode_utf16().collect();
+        let scene_ranges = task.frozen_context["sceneReview"]["ranges"].as_array();
         let known = read_canon(&tx)?;
         let mut candidate_keys = HashSet::new();
         for mut candidate in candidates {
@@ -519,6 +537,16 @@ impl Project {
                     .iter()
                     .all(|id| known.iter().any(|entry| &entry.entry_id == id))
                 || !candidate.anchor.matches(&manuscript)
+                || scene_ranges.is_some_and(|ranges| {
+                    !ranges.iter().any(|range| {
+                        range["start"]
+                            .as_u64()
+                            .is_some_and(|start| start <= candidate.anchor.start_offset as u64)
+                            && range["end"]
+                                .as_u64()
+                                .is_some_and(|end| end >= candidate.anchor.end_offset as u64)
+                    })
+                })
             {
                 problem = "部分候选缺少可核验的精确原文锚点或必填字段".into();
                 continue;
@@ -571,7 +599,6 @@ impl Project {
             ]
             .iter()
             .any(|term| candidate.summary.contains(term) || candidate.anchor.quote.contains(term));
-            // Routine content stays in author memory until an author supplies its audience.
             let routine = current
                 && candidate.objective_routine
                 && candidate.confidence == "high"
@@ -582,10 +609,48 @@ impl Project {
                     candidate.event_type.as_str(),
                     "chapter_summary" | "location_move" | "minor_extra" | "prop_transfer"
                 );
+            // Only verbatim routine actions wholly inside a witnessed scene can inherit its audience.
+            let mut audience = private();
+            if routine
+                && candidate.summary.trim() == candidate.anchor.quote.trim()
+                && matches!(
+                    candidate.event_type.as_str(),
+                    "location_move" | "prop_transfer"
+                )
+            {
+                let witness = task.frozen_context["viewpoints"]
+                    .as_array()
+                    .and_then(|ranges| {
+                        ranges
+                            .iter()
+                            .find(|range| {
+                                range["start"].as_u64().is_some_and(|start| {
+                                    start <= candidate.anchor.start_offset as u64
+                                }) && range["end"]
+                                    .as_u64()
+                                    .is_some_and(|end| end >= candidate.anchor.end_offset as u64)
+                            })
+                            .and_then(|range| range["povCharacterId"].as_str())
+                    })
+                    .and_then(|id| {
+                        known
+                            .iter()
+                            .find(|entry| entry.category == "character" && entry.entry_id == id)
+                    });
+                if let Some(person) = witness.filter(|person| {
+                    std::iter::once(&person.name)
+                        .chain(&person.aliases)
+                        .any(|name| candidate.anchor.quote.contains(name))
+                }) {
+                    audience.scope = "named_characters".into();
+                    audience.visible_to.push(person.entry_id.clone());
+                }
+            }
             tx.execute("INSERT INTO story_events(event_id,source_revision_id,event_type,subject_ids_json,summary,payload_json,
                 evidence_anchor_json,confidence,approval_status,world_time_label,created_at,active_revision_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?2)",
                 params![id(),revision,candidate.event_type,subjects,candidate.summary,
-                    json!({ "audience": private(), "taskId": task_id, "unclassifiedRoutine": routine }).to_string(),
+                    json!({ "unclassifiedRoutine": routine && audience.scope == "narrator_only",
+                        "audience": audience, "taskId": task_id }).to_string(),
                     anchor,candidate.confidence,if routine { "auto_accepted" } else { "pending" },candidate.time,now()])?;
         }
         tx.execute(
@@ -762,12 +827,12 @@ impl Project {
 fn update_sync(db: &Connection, revision: &str, chapter: &str) -> Result<()> {
     let state: String = db.query_row("SELECT CASE
         WHEN EXISTS(SELECT 1 FROM generation_tasks WHERE base_revision_id=?1 AND task_type IN('memory_extract','consistency_check')
-            AND state IN('running','streaming')) THEN 'processing'
+            AND json_extract(frozen_context_json,'$.stagedDraftId') IS NULL AND state IN('running','streaming')) THEN 'processing'
         WHEN EXISTS(SELECT 1 FROM story_events WHERE active_revision_id=?1 AND approval_status='pending')
             OR COALESCE((SELECT m.problem FROM memory_ingest m JOIN generation_tasks g ON g.task_id=m.task_id
                 WHERE g.base_revision_id=?1 ORDER BY g.rowid DESC LIMIT 1),'')<>'' THEN 'needs_confirm'
         WHEN EXISTS(SELECT 1 FROM memory_ingest m JOIN generation_tasks g ON g.task_id=m.task_id
-                WHERE g.base_revision_id=?1 AND m.problem='') THEN 'synced'
+                WHERE g.base_revision_id=?1 AND m.problem='' AND json_extract(g.frozen_context_json,'$.sceneReview') IS NULL) THEN 'synced'
         ELSE 'pending' END", [revision], |r| r.get(0))?;
     db.execute(
         "UPDATE chapters SET memory_sync_status=?1,memory_version=memory_version+1

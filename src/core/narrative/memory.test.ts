@@ -3,6 +3,7 @@ import type { Chapter, ModelProfile, Project, Revision, Scene } from '../contrac
 import { cjkIndex, cjkQuery } from '../db/fts'
 import { freezeContext } from './freeze'
 import { emptyAudience, emptyMemory, extractCandidates, memoryAnalysis, sourceAnchor, writerMemory, type Fact } from './memory'
+import { builtins } from '../skills/builtins'
 
 const book: Project = { title: '渡口', projectId: 'novel', path: 'local.story', targetBeatChars: 900, targetChapterChars: 2000 }
 const chapter: Chapter = { chapterId: 'next', chapterOrder: 2, currentRevisionId: 'r2', title: '船票', status: 'accepted' }
@@ -99,4 +100,33 @@ it('在 100 章事实中保留最近线索和指定检索命中，限制主笔�
   expect(writer.context).toContain('第1次渡船启程')
   expect(writer.context).toContain('第100次渡船启程')
   expect(writer.context).not.toContain('调包账本')
+})
+
+it('冻结当前卡带路标和真正送入主笔的证据，换视角后去掉未获知事件', () => {
+  const memory = adversarialMemory()
+  const base = memory.events[0]!
+  const witnessed = { ...base, eventId: 'witnessed', eventType: 'prop_transfer' as const,
+    summary: '许眠把黄铜钥匙交给贺南。', audience: { ...emptyAudience(), scope: 'named_characters' as const, visibleTo: ['hero'] } }
+  memory.events.push({ ...witnessed, anchor: { quote: witnessed.summary, startOffset: 0, endOffset: witnessed.summary.length } })
+  const cartridge = builtins.find(pack => pack.itemId === 'storyforge.cartridge.mystery')!
+  const stage = cartridge.metadata.stages![1]!
+  const capture = (povCharacterId?: string, activePackId: string | null = cartridge.itemId) => freezeContext(
+    book, chapter, revision, model, '', '', {
+      scene: { ...scene, title: '渡口搜证', details: { ...scene.details, povCharacterId,
+        cartridgeStage: { packId: cartridge.itemId, stage } } },
+      memory, catalog: { packs: builtins, activePackId, activeBaseSkillId: null },
+    },
+  )
+  const first = capture('hero')
+  expect(first.cartridgeStage).toBe(stage)
+  expect(first.prompt).toContain('本场卡带路标：' + stage)
+  expect(first.prompt).not.toContain(cartridge.metadata.stages![2])
+  expect(first.prompt).toContain(witnessed.summary)
+  expect(first.memoryEvidence?.map(item => item.eventId)).toEqual(['witnessed'])
+  const alternative = capture('hero', null)
+  expect(alternative.prompt).not.toContain(stage)
+  expect(alternative.prompt).toContain(witnessed.summary)
+  expect(capture().prompt).not.toContain(witnessed.summary)
+  const audit = memoryAnalysis('consistency_check', book, chapter, revision, model, memory, 'hero')
+  expect(audit.viewpointAlerts?.some(item => item.anchor.quote === '七号锅炉夹层')).toBe(true)
 })

@@ -1,7 +1,10 @@
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 
-use super::{current_revision, find_task, id, now, Project, Revision, RevisionInput, Task};
+use super::{
+    append_drafts, current_revision, find_task, han_count, id, now, Project, Revision,
+    RevisionInput, Task,
+};
 use crate::{
     error::{Result, StudioError},
     profiles::Profile,
@@ -22,8 +25,10 @@ pub struct Batch {
     pub chapter_ids: Vec<String>,
     pub cursor: usize,
     pub phase: String,
+    pub draft_task_id: Option<String>,
     pub audited_revision_id: Option<String>,
     pub state: String,
+    pub mode: String,
     pub budget_usd: f64,
     pub spent_usd: f64,
     pub instruction: String,
@@ -44,6 +49,37 @@ pub struct BatchInput {
     pub writer_profile: String,
     pub audit_profile: String,
     pub extraction_profile: String,
+    pub mode: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchSummary {
+    pub batch_id: String,
+    pub state: String,
+    pub mode: String,
+    pub created_at: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchActivity {
+    pub task_id: String,
+    pub phase: String,
+    pub state: String,
+    pub model: String,
+    pub created_at: String,
+    pub cost_usd: Option<f64>,
+    pub revision_id: Option<String>,
+    pub problem: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchDraft {
+    pub task_id: String,
+    pub content: String,
+    pub appendix: String,
 }
 
 fn valid_budget(budget: f64) -> bool {
@@ -55,11 +91,11 @@ fn conflict(message: &str) -> StudioError {
 
 fn batch(db: &Connection, requested: Option<&str>) -> Result<Option<Batch>> {
     let stored = db.query_row("SELECT batch_id,chapters_json,cursor,phase,state,budget_usd,spent_usd,instruction,writer_profile,
-        audit_profile,extraction_profile,reason,audited_revision_id FROM batch_runs WHERE (?1 IS NULL OR batch_id=?1) ORDER BY rowid DESC LIMIT 1",
+        audit_profile,extraction_profile,reason,audited_revision_id,draft_task_id,mode FROM batch_runs WHERE (?1 IS NULL OR batch_id=?1) ORDER BY rowid DESC LIMIT 1",
         [requested], |r| Ok((r.get::<_,String>(1)?, Batch {
             batch_id:r.get(0)?,chapter_ids:vec![],cursor:r.get(2)?,phase:r.get(3)?,state:r.get(4)?,budget_usd:r.get(5)?,
             spent_usd:r.get(6)?,instruction:r.get(7)?,writer_profile:r.get(8)?,audit_profile:r.get(9)?,
-            extraction_profile:r.get(10)?,reason:r.get(11)?,audited_revision_id:r.get(12)?,estimated_steps:0,step:None,
+            extraction_profile:r.get(10)?,reason:r.get(11)?,audited_revision_id:r.get(12)?,draft_task_id:r.get(13)?,mode:r.get(14)?,estimated_steps:0,step:None,
         }))).optional()?;
     let Some((chapters, mut run)) = stored else {
         return Ok(None);
@@ -82,6 +118,97 @@ fn update_pause(db: &Connection, id: &str, reason: &str) -> Result<()> {
     Ok(())
 }
 
+fn staged_text(db: &Connection, task: &Task) -> Result<BatchDraft> {
+    let prior = match &task.base_revision_id {
+        Some(revision) => db.query_row(
+            "SELECT content FROM chapter_revisions WHERE revision_id=?1",
+            [revision],
+            |row| row.get(0),
+        )?,
+        None => String::new(),
+    };
+    let carry = task.frozen_context["carryDraft"]
+        .as_str()
+        .unwrap_or_default();
+    let parts = [carry, task.partial_output.as_str()];
+    Ok(BatchDraft {
+        task_id: task.task_id.clone(),
+        content: append_drafts(prior, parts),
+        appendix: append_drafts(String::new(), parts),
+    })
+}
+
+fn audit_passes(task: &Task) -> bool {
+    if task.frozen_context["viewpointAlerts"]
+        .as_array()
+        .is_some_and(|alerts| !alerts.is_empty())
+    {
+        return false;
+    }
+    let text = task.partial_output.trim();
+    let text = text
+        .strip_prefix("```")
+        .and_then(|body| body.strip_suffix("```"))
+        .map_or(text, |body| {
+            body.strip_prefix("json").unwrap_or(body).trim()
+        });
+    serde_json::from_str::<serde_json::Value>(text)
+        .ok()
+        .is_some_and(|value| {
+            value["findings"].as_array().is_some_and(|items| {
+                items.len() <= 30 && items.iter().all(|item| item["severity"] == "notice")
+            })
+        })
+}
+
+pub(super) fn approved_batch_draft(db: &Connection, task: &Task) -> Result<String> {
+    let id = task.frozen_context["batchId"]
+        .as_str()
+        .ok_or_else(|| conflict("草稿不属于连写批次"))?;
+    let run = required(db, id)?;
+    if run.state != "running"
+        || run.phase != "adopt"
+        || run.step.is_some()
+        || run.draft_task_id.as_deref() != Some(&task.task_id)
+        || run.chapter_ids.get(run.cursor) != Some(&task.chapter_id)
+    {
+        return Err(conflict("后台草稿须先通过一致性审查再自动采纳"));
+    }
+    let (scene_id, scene_version): (Option<String>, Option<i64>) = db.query_row(
+        "SELECT c.active_scene_id,s.version FROM chapters c LEFT JOIN writing_scenes s ON s.scene_id=c.active_scene_id WHERE c.chapter_id=?1",
+        [&task.chapter_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    if task.frozen_context.get("sceneBindingId").is_some()
+        && task.frozen_context["sceneBindingId"].as_str() != scene_id.as_deref()
+    {
+        return Err(conflict("审查后当前场景已变化，请重置暂存稿后继续"));
+    }
+    let audit_id: String = db.query_row(
+        "SELECT s.task_id FROM batch_steps s JOIN generation_tasks g ON g.task_id=s.task_id
+         WHERE s.batch_id=?1 AND s.chapter_id=?2 AND s.phase='audit' AND s.settled_usd IS NOT NULL
+         AND json_extract(g.frozen_context_json,'$.stagedDraftId')=?3 ORDER BY s.rowid DESC LIMIT 1",
+        params![id,task.chapter_id,task.task_id], |row| row.get(0))
+        .optional()?.ok_or_else(|| conflict("暂存稿缺少通过的一致性审查"))?;
+    let audit = find_task(db, &audit_id)?;
+    if audit.state != "completed" || !audit_passes(&audit) {
+        return Err(conflict("暂存稿的一致性审查仍有重大告警或结果无效"));
+    }
+    if (audit.frozen_context.get("sceneBindingVersion").is_some()
+        && audit.frozen_context["sceneBindingVersion"].as_i64() != scene_version)
+        || (audit.frozen_context["memoryStamp"]
+            .as_str()
+            .is_some_and(|stamp| {
+                Project::read_memory(db)
+                    .map(|snapshot| snapshot.stamp != stamp)
+                    .unwrap_or(true)
+            }))
+    {
+        return Err(conflict("审查后记忆或场景已变化，请重新审查暂存稿"));
+    }
+    Ok(run.batch_id)
+}
+
 pub fn profile_price(profile: &Profile) -> Option<(f64, f64)> {
     let rates = profile.rates.as_ref()?;
     let input = rates
@@ -97,11 +224,58 @@ impl Project {
         batch(&self.conn, None)
     }
 
+    pub fn batch_history(&self) -> Result<Vec<BatchSummary>> {
+        let mut query = self
+            .conn
+            .prepare("SELECT batch_id,state,mode,created_at FROM batch_runs ORDER BY rowid DESC")?;
+        let rows = query
+            .query_map([], |r| {
+                Ok(BatchSummary {
+                    batch_id: r.get(0)?,
+                    state: r.get(1)?,
+                    mode: r.get(2)?,
+                    created_at: r.get(3)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    pub fn named_batch(&self, id: &str) -> Result<Batch> {
+        required(&self.conn, id)
+    }
+
+    pub fn batch_activity(&self, id: &str, chapter_id: &str) -> Result<Vec<BatchActivity>> {
+        let mut query = self.conn.prepare(
+            "SELECT s.task_id,s.phase,g.state,COALESCE(json_extract(g.frozen_context_json,'$.model'),''),
+                s.created_at,s.settled_usd,s.adopted_revision_id,s.problem
+             FROM batch_steps s JOIN generation_tasks g ON g.task_id=s.task_id
+             WHERE s.batch_id=?1 AND s.chapter_id=?2 ORDER BY s.rowid",
+        )?;
+        let rows = query
+            .query_map(params![id, chapter_id], |r| {
+                Ok(BatchActivity {
+                    task_id: r.get(0)?,
+                    phase: r.get(1)?,
+                    state: r.get(2)?,
+                    model: r.get(3)?,
+                    created_at: r.get(4)?,
+                    cost_usd: r.get(5)?,
+                    revision_id: r.get(6)?,
+                    problem: r.get(7)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
     pub fn start_batch(&mut self, input: BatchInput) -> Result<Batch> {
+        let mode = input.mode.as_deref().unwrap_or("automatic");
         if !valid_budget(input.budget_usd)
             || input.chapter_ids.is_empty()
             || input.chapter_ids.len() > 100
             || input.instruction.len() > 4800
+            || !matches!(mode, "automatic" | "assisted")
         {
             return Err(StudioError::new(400, "请选择 1 至 100 章并填写有效预算"));
         }
@@ -118,9 +292,9 @@ impl Project {
         chapters.sort_by_key(|row| row.0);
         let ids: Vec<_> = chapters.into_iter().map(|(_, id)| id).collect();
         let batch_id = id();
-        tx.execute("INSERT INTO batch_runs(batch_id,chapters_json,budget_usd,instruction,writer_profile,audit_profile,extraction_profile,created_at)
-            VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",params![batch_id,serde_json::to_string(&ids)?,input.budget_usd,
-                input.instruction,input.writer_profile,input.audit_profile,input.extraction_profile,now()])?;
+        tx.execute("INSERT INTO batch_runs(batch_id,chapters_json,budget_usd,instruction,writer_profile,audit_profile,extraction_profile,created_at,mode)
+            VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",params![batch_id,serde_json::to_string(&ids)?,input.budget_usd,
+                input.instruction,input.writer_profile,input.audit_profile,input.extraction_profile,now(),mode])?;
         let run = required(&tx, &batch_id)?;
         tx.commit()?;
         Ok(run)
@@ -144,7 +318,9 @@ impl Project {
                     [id],
                 )?;
             }
-            "resume" if run.state == "paused" => {
+            "resume" | "approve"
+                if run.state == "paused" && (action == "approve") == (run.phase == "approval") =>
+            {
                 let budget = budget_usd.unwrap_or(run.budget_usd);
                 if !valid_budget(budget)
                     || budget + 1.0e-12
@@ -152,7 +328,26 @@ impl Project {
                 {
                     return Err(StudioError::new(400, "预算必须覆盖已记账和预留用量"));
                 }
-                self.conn.execute("UPDATE batch_runs SET state='running',budget_usd=?1,reason='' WHERE batch_id=?2",params![budget,id])?;
+                let phase = if action == "approve" {
+                    "adopt"
+                } else {
+                    &run.phase
+                };
+                self.conn.execute("UPDATE batch_runs SET state='running',budget_usd=?1,phase=?2,reason='' WHERE batch_id=?3",params![budget,phase,id])?;
+            }
+            "reset_draft"
+                if run.state == "paused" && run.step.is_none() && run.draft_task_id.is_some() =>
+            {
+                self.conn.execute("UPDATE batch_runs SET phase='write',draft_task_id=NULL,audited_revision_id=NULL,
+                    reason='暂存稿已保留在任务历史，可按当前正文继续' WHERE batch_id=?1", [id])?;
+            }
+            "reaudit"
+                if run.state == "paused" && run.step.is_none() && run.draft_task_id.is_some() =>
+            {
+                self.conn.execute(
+                    "UPDATE batch_runs SET phase='audit',state='running',audited_revision_id=NULL,reason='' WHERE batch_id=?1",
+                    [id],
+                )?;
             }
             _ => return Err(conflict("批次状态已更新。等待当前请求结算后可结束。")),
         }
@@ -187,8 +382,26 @@ impl Project {
             || profile_id != &profile.id
             || run.chapter_ids.get(run.cursor) != Some(&task.chapter_id)
             || task.base_revision_id != current_revision(&tx, &task.chapter_id)?
+            || (matches!(run.phase.as_str(), "write" | "audit")
+                && task.frozen_context["stagedDraftId"].as_str() != run.draft_task_id.as_deref())
         {
             return Err(conflict("后台任务状态有变化，请刷新批次"));
+        }
+        if let Some(draft_id) = &run.draft_task_id {
+            let draft = find_task(&tx, draft_id)?;
+            let active_scene: Option<String> = tx.query_row(
+                "SELECT active_scene_id FROM chapters WHERE chapter_id=?1",
+                [&task.chapter_id],
+                |row| row.get(0),
+            )?;
+            if draft.base_revision_id != task.base_revision_id
+                || draft.frozen_context["sceneBindingId"].as_str() != active_scene.as_deref()
+                || (run.phase == "write"
+                    && task.frozen_context["carryDraft"].as_str()
+                        != Some(&staged_text(&tx, &draft)?.appendix))
+            {
+                return Err(conflict("正式正文或当前场景已变化，请重置暂存稿后继续"));
+            }
         }
         let body = &task.frozen_context["requestBody"];
         let Some(max_output) = body[&profile.token_limit_field]
@@ -238,21 +451,25 @@ impl Project {
     }
 
     pub fn adopt_batch_draft(&mut self, batch_id: &str, task_id: &str) -> Result<Revision> {
-        let run = required(&self.conn, batch_id)?;
-        let step = run
-            .step
-            .filter(|step| step.task_id == task_id)
-            .ok_or_else(|| conflict("该稿不在当前批次"))?;
         let task = find_task(&self.conn, task_id)?;
-        if task.task_type != "batch_write" || task.state != "completed" {
-            return Err(conflict("该稿尚不能采纳"));
-        }
-        if let Some(adopted) = step.adopted_revision_id {
+        let adopted: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT adopted_revision_id FROM batch_steps WHERE batch_id=?1 AND task_id=?2",
+                params![batch_id, task_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        if let Some(adopted) = adopted {
             return self
                 .revisions(&task.chapter_id)?
                 .into_iter()
                 .find(|revision| revision.revision_id == adopted)
                 .ok_or_else(|| conflict("找不到已采用修订"));
+        }
+        if approved_batch_draft(&self.conn, &task)? != batch_id {
+            return Err(conflict("该稿不在当前批次"));
         }
         self.save_revision(RevisionInput {
             chapter_id: task.chapter_id,
@@ -263,6 +480,16 @@ impl Project {
             edit_level: None,
             canon_confirmed: false,
         })
+    }
+
+    pub fn preview_batch_draft(&self, id: &str) -> Result<Option<BatchDraft>> {
+        required(&self.conn, id)?
+            .draft_task_id
+            .map(|draft_id| {
+                let draft = find_task(&self.conn, &draft_id)?;
+                staged_text(&self.conn, &draft)
+            })
+            .transpose()
     }
 
     pub fn settle_batch_step(
@@ -331,20 +558,27 @@ impl Project {
             |r| r.get(0),
         )?;
         let amount = known_billed.unwrap_or(if sent { step.reserved_usd } else { 0.0 });
-        let next = if task.state == "completed" && passed {
+        let problem =
+            if run.phase == "audit" && passed && problem.is_empty() && !audit_passes(&task) {
+                "一致性审查仍有重大告警或结果无效"
+            } else {
+                problem
+            };
+        let mut staged = run.draft_task_id;
+        let next = if task.state == "completed" && passed && problem.is_empty() {
             match run.phase.as_str() {
-                "write" if step.adopted_revision_id.is_some() => {
-                    let chars: i64 = tx.query_row(
-                        "SELECT cjk_char_count FROM chapter_revisions WHERE revision_id=?1",
-                        [step.adopted_revision_id],
-                        |r| r.get(0),
-                    )?;
-                    if chars >= self.info.target_chapter_chars {
+                "write" => {
+                    staged = Some(task.task_id.clone());
+                    if han_count(&staged_text(&tx, &task)?.content) as i64
+                        >= self.info.target_chapter_chars
+                    {
                         "audit"
                     } else {
                         "write"
                     }
                 }
+                "audit" if staged.is_some() && run.mode == "assisted" => "approval",
+                "audit" if staged.is_some() => "adopt",
                 "audit" => "extract",
                 "extract" => "advance",
                 _ => run.phase.as_str(),
@@ -353,12 +587,8 @@ impl Project {
             run.phase.as_str()
         };
         tx.execute(
-            "UPDATE batch_steps SET settled_usd=?1 WHERE task_id=?2",
-            params![amount, task_id],
-        )?;
-        tx.execute(
-            "UPDATE batch_runs SET spent_usd=spent_usd+?1,phase=?2 WHERE batch_id=?3",
-            params![amount, next, id],
+            "UPDATE batch_runs SET spent_usd=spent_usd+?1,phase=?2,draft_task_id=?3 WHERE batch_id=?4",
+            params![amount, next, staged, id],
         )?;
         if run.phase == "audit" && next == "extract" {
             tx.execute(
@@ -376,12 +606,23 @@ impl Project {
             problem
         } else if task.state != "completed" || !passed {
             "后台步骤没有完成"
+        } else if next == "approval" {
+            "本章已通过检查，等待作者确认暂存稿"
         } else {
             ""
         };
         if !reason.is_empty() {
             update_pause(&tx, id, reason)?;
         }
+        let step_problem = if reason == "本章已通过检查，等待作者确认暂存稿" {
+            ""
+        } else {
+            reason
+        };
+        tx.execute(
+            "UPDATE batch_steps SET settled_usd=?1,problem=?2 WHERE task_id=?3",
+            params![amount, step_problem, task_id],
+        )?;
         let updated = required(&tx, id)?;
         tx.commit()?;
         Ok(updated)
@@ -403,7 +644,7 @@ impl Project {
             LEFT JOIN chapter_revisions r ON r.revision_id=c.current_revision_id WHERE c.chapter_id=?1 AND c.status!='archived'",
             [chapter],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
         match run.phase.as_str() {
-            "write" if count >= self.info.target_chapter_chars => {
+            "write" if run.draft_task_id.is_none() && count >= self.info.target_chapter_chars => {
                 tx.execute(
                     "UPDATE batch_runs SET phase='audit' WHERE batch_id=?1",
                     [id],
@@ -468,6 +709,7 @@ mod tests {
 
     fn run(chapters: Vec<String>, budget: f64) -> BatchInput {
         BatchInput {
+            mode: None,
             chapter_ids: chapters,
             budget_usd: budget,
             instruction: String::new(),
@@ -479,7 +721,7 @@ mod tests {
     fn create(project: &mut Project, run: &Batch, kind: &str, base: Option<String>) -> Task {
         let chapter_id = run.chapter_ids[run.cursor].clone();
         project.create_task(TaskInput { idempotency_key:id(),chapter_id,base_revision_id:base,task_type:kind.into(),
-            frozen_context:json!({"batchId":run.batch_id,"profileId":"fixture","prompt":"测试","rates":{"input":1,"output":1},
+            frozen_context:json!({"batchId":run.batch_id,"stagedDraftId":run.draft_task_id,"profileId":"fixture","prompt":"测试","rates":{"input":1,"output":1},
                 "requestBody":{"max_tokens":4096}}) }).unwrap()
     }
 
@@ -549,26 +791,25 @@ mod tests {
         project
             .finish_task(&draft.task_id, "completed", None, None, usage())
             .unwrap();
-        let accepted = project
-            .adopt_batch_draft(&resumed.batch_id, &draft.task_id)
-            .unwrap();
         assert_eq!(
             project
                 .adopt_batch_draft(&resumed.batch_id, &draft.task_id)
+                .err()
                 .unwrap()
-                .revision_id,
-            accepted.revision_id
+                .status,
+            409
         );
         let audit_stage = project
             .settle_batch_step(&resumed.batch_id, &draft.task_id, "", true)
             .unwrap();
         assert_eq!(audit_stage.phase, "audit");
-        let audit = create(
-            &mut project,
-            &audit_stage,
-            "consistency_check",
-            Some(accepted.revision_id.clone()),
-        );
+        assert_eq!(current_revision(&project.conn, &chapter).unwrap(), None);
+        let audited_text = project
+            .preview_batch_draft(&resumed.batch_id)
+            .unwrap()
+            .unwrap()
+            .content;
+        let audit = create(&mut project, &audit_stage, "consistency_check", None);
         project
             .reserve_batch_step(&initial.batch_id, &audit.task_id, &profile())
             .unwrap();
@@ -580,7 +821,116 @@ mod tests {
             .settle_batch_step(&initial.batch_id, &audit.task_id, "重大一致性告警", true)
             .unwrap();
         assert_eq!(hold.state, "paused");
-        assert_eq!(hold.phase, "extract");
-        assert_eq!(hold.audited_revision_id, Some(accepted.revision_id));
+        assert_eq!(hold.phase, "audit");
+        assert_eq!(hold.draft_task_id.as_deref(), Some(draft.task_id.as_str()));
+        assert_eq!(current_revision(&project.conn, &chapter).unwrap(), None);
+        let rerun = project
+            .control_batch(&initial.batch_id, "resume", None, None)
+            .unwrap();
+        let audit = create(&mut project, &rerun, "consistency_check", None);
+        project
+            .reserve_batch_step(&initial.batch_id, &audit.task_id, &profile())
+            .unwrap();
+        project.claim_task(&audit.task_id).unwrap();
+        project
+            .append_token(&audit.task_id, r#"{"findings":[]}"#)
+            .unwrap();
+        project
+            .finish_task(&audit.task_id, "completed", None, None, usage())
+            .unwrap();
+        let passed = project
+            .settle_batch_step(&initial.batch_id, &audit.task_id, "", true)
+            .unwrap();
+        assert_eq!(passed.phase, "adopt");
+        let accepted = project
+            .adopt_batch_draft(&initial.batch_id, &draft.task_id)
+            .unwrap();
+        assert_eq!(accepted.content, audited_text);
+        assert_eq!(
+            project
+                .adopt_batch_draft(&initial.batch_id, &draft.task_id)
+                .unwrap()
+                .revision_id,
+            accepted.revision_id
+        );
+        let run = project.latest_batch().unwrap().unwrap();
+        assert_eq!(run.phase, "extract");
+        assert_eq!(run.audited_revision_id, Some(accepted.revision_id));
+    }
+
+    #[test]
+    fn assisted_run_requires_explicit_approval_after_reopening() {
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("辅助托管.story");
+        let mut project = Project::create(path.clone(), "辅助托管").unwrap();
+        let chapter = project.chapters().unwrap().remove(0).chapter_id;
+        let mut input = run(vec![chapter.clone()], 1.0);
+        input.mode = Some("assisted".into());
+        let run = project.start_batch(input).unwrap();
+        let usage = || {
+            Some(Metering {
+                cost_usd: Some(0.0003),
+                ..Default::default()
+            })
+        };
+        let draft = create(&mut project, &run, "batch_write", None);
+        project
+            .reserve_batch_step(&run.batch_id, &draft.task_id, &profile())
+            .unwrap();
+        project.claim_task(&draft.task_id).unwrap();
+        project
+            .append_token(&draft.task_id, &"雨下在空船上。".repeat(400))
+            .unwrap();
+        project
+            .finish_task(&draft.task_id, "completed", None, None, usage())
+            .unwrap();
+        let audit_phase = project
+            .settle_batch_step(&run.batch_id, &draft.task_id, "", true)
+            .unwrap();
+        let audit = create(&mut project, &audit_phase, "consistency_check", None);
+        project
+            .reserve_batch_step(&run.batch_id, &audit.task_id, &profile())
+            .unwrap();
+        project.claim_task(&audit.task_id).unwrap();
+        project
+            .append_token(&audit.task_id, r#"{"findings":[]}"#)
+            .unwrap();
+        project
+            .finish_task(&audit.task_id, "completed", None, None, usage())
+            .unwrap();
+        assert_eq!(
+            project
+                .settle_batch_step(&run.batch_id, &audit.task_id, "", true)
+                .unwrap()
+                .phase,
+            "approval"
+        );
+        drop(project);
+        let mut project = Project::open(path).unwrap();
+        assert_eq!(project.latest_batch().unwrap().unwrap().phase, "approval");
+        assert_eq!(
+            project
+                .batch_activity(&run.batch_id, &chapter)
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(project
+            .control_batch(&run.batch_id, "resume", None, None)
+            .is_err());
+        assert!(project
+            .adopt_batch_draft(&run.batch_id, &draft.task_id)
+            .is_err());
+        assert!(current_revision(&project.conn, &chapter).unwrap().is_none());
+        project
+            .control_batch(&run.batch_id, "approve", None, None)
+            .unwrap();
+        let revision = project
+            .adopt_batch_draft(&run.batch_id, &draft.task_id)
+            .unwrap();
+        assert_eq!(
+            project.batch_activity(&run.batch_id, &chapter).unwrap()[0].revision_id,
+            Some(revision.revision_id)
+        );
     }
 }
