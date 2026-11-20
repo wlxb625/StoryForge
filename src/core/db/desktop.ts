@@ -1,5 +1,6 @@
 import { invoke, isTauri } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
+import type { Audience, Candidate, Canon, Knowledge, Memory, MemoryRoles, Note, SearchHit } from '../narrative/memory'
 import type {
   Capabilities, Chapter, GenerationTask, ModelProfile, ProbeResult, ProfileInput, Project, Revision,
   RevisionInput, TaskEvent, TaskInput, Pack, StyleCatalog, Scene, SceneInput, PromptRevision, Trace,
@@ -49,6 +50,18 @@ export const desktop = {
   prompts: () => call<PromptRevision[]>('prompt_revisions'),
   savePrompt: (instruction: string) => call<PromptRevision>('save_prompt_revision', { instruction }),
   traces: () => call<Trace[]>('list_llm_traces'),
+  memory: () => call<Memory>('read_memory'),
+  writeCanon: (entry: Canon) => call<Canon>('write_canon', { entry }),
+  writeNote: (note: Note) => call<void>('write_note', { note }),
+  writeKnowledge: (knowledge: Knowledge) => call<void>('write_knowledge', { knowledge }),
+  writeMemoryRoles: (roles: MemoryRoles) => call<void>('write_memory_roles', { roles }),
+  ingestMemory: (taskId: string, candidates: Candidate[], problem: string) => call<void>('ingest_memory', { taskId, candidates, problem }),
+  reviewFact: (eventId: string, action: 'accept' | 'reject' | 'undo', audience?: Audience) =>
+    call<void>('review_memory_fact', { eventId, action, audience: audience ?? null }),
+  refreshMemoryStatus: (chapterId: string, revisionId: string) => call<void>('refresh_memory_status', { chapterId, revisionId }),
+  staleIndexes: () => call<Array<{ chapterId: string; revisionId: string; content: string }>>('stale_indexes'),
+  indexChapter: (chapterId: string, revisionId: string, bigrams: string) => call<boolean>('index_chapter', { chapterId, revisionId, bigrams }),
+  searchText: (phrase: string, exact: string) => call<SearchHit[]>('search_text', { phrase, exact }),
   listen: (onEvent: (event: TaskEvent) => void) =>
     listen<TaskEvent>('storyforge-task', ({ payload }) => onEvent(payload)),
 }

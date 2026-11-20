@@ -16,6 +16,7 @@ use uuid::Uuid;
 use crate::error::{Result, StudioError};
 
 pub mod catalog;
+pub mod memory;
 
 pub const SCHEMA: &str = include_str!("schema.sql");
 const TASK_COLUMNS: &str = "task_id, chapter_id, base_revision_id, state, frozen_context_json, partial_output, last_event_seq, task_type";
@@ -55,6 +56,7 @@ pub struct Chapter {
     pub current_revision_id: Option<String>,
     pub status: String,
     pub active_scene_id: Option<String>,
+    pub memory_sync_status: String,
 }
 
 fn read_chapter(row: &Row<'_>) -> rusqlite::Result<Chapter> {
@@ -65,6 +67,7 @@ fn read_chapter(row: &Row<'_>) -> rusqlite::Result<Chapter> {
         current_revision_id: row.get(3)?,
         status: row.get(4)?,
         active_scene_id: row.get(5)?,
+        memory_sync_status: row.get(6)?,
     })
 }
 
@@ -223,13 +226,13 @@ impl Project {
                 |row| row.get(0),
             )
             .map_err(|_| StudioError::new(400, "这个文件不是有效的 StoryForge 工程"))?;
-        if !matches!(version, 1 | 2) {
+        if !(1..=3).contains(&version) {
             return Err(StudioError::new(409, "工程版本与当前应用不兼容"));
         }
         conn.execute_batch(
             "PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;",
         )?;
-        if version == 1 {
+        if version < 3 {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let current: i64 =
                 tx.query_row("SELECT schema_version FROM project_meta LIMIT 1", [], |r| {
@@ -238,6 +241,10 @@ impl Project {
             if current == 1 {
                 tx.execute_batch(include_str!("002_creation.sql"))?;
                 tx.execute("UPDATE project_meta SET schema_version=2", [])?;
+            }
+            if current < 3 {
+                tx.execute_batch(include_str!("003_memory.sql"))?;
+                tx.execute("UPDATE project_meta SET schema_version=3", [])?;
             }
             tx.commit()?;
         }
@@ -250,7 +257,7 @@ impl Project {
 
     pub fn chapters(&self) -> Result<Vec<Chapter>> {
         let mut query = self.conn.prepare(
-            "SELECT chapter_id,title,chapter_order,current_revision_id,status,active_scene_id FROM chapters
+            "SELECT chapter_id,title,chapter_order,current_revision_id,status,active_scene_id,memory_sync_status FROM chapters
             WHERE status!='archived' ORDER BY chapter_order, chapter_id",
         )?;
         let rows = query
@@ -261,7 +268,7 @@ impl Project {
 
     pub fn archived_chapters(&self) -> Result<Vec<Chapter>> {
         let mut query = self.conn.prepare(
-            "SELECT chapter_id,title,chapter_order,current_revision_id,status,active_scene_id FROM chapters
+            "SELECT chapter_id,title,chapter_order,current_revision_id,status,active_scene_id,memory_sync_status FROM chapters
             WHERE status='archived' ORDER BY updated_at DESC",
         )?;
         let rows = query
@@ -324,6 +331,7 @@ impl Project {
             current_revision_id: None,
             status: "planned".into(),
             active_scene_id: None,
+            memory_sync_status: "pending".into(),
         })
     }
 
@@ -497,6 +505,10 @@ impl Project {
             params![revision.revision_id, input.chapter_id, revision.parent_revision_id, revision.save_kind, revision.source_tag,
                 revision.content, hash(&revision.content), revision.cjk_char_count, revision.created_at])?;
         if save_kind == "formal_revision" {
+            if source_tag == "ai_gen" {
+                tx.execute("UPDATE story_events SET active_revision_id=?1 WHERE active_revision_id=?2 AND event_type!='chapter_summary'",
+                    params![revision.revision_id,revision.parent_revision_id])?;
+            }
             tx.execute("UPDATE chapters SET current_revision_id=?1,status='accepted',memory_sync_status='pending',updated_at=?2 WHERE chapter_id=?3",
                 params![revision.revision_id, revision.created_at, input.chapter_id])?;
         }
@@ -509,7 +521,11 @@ impl Project {
             || input.idempotency_key.len() > 128
             || !matches!(
                 input.task_type.as_str(),
-                "beat_write" | "ab_write" | "skill_extract"
+                "beat_write"
+                    | "ab_write"
+                    | "skill_extract"
+                    | "memory_extract"
+                    | "consistency_check"
             )
         {
             return Err(StudioError::new(400, "无效的节拍生成请求"));
@@ -864,7 +880,7 @@ mod tests {
     fn story_schema_wal_and_chapter_ids_survive_editing_order() {
         let (_temp, mut project, first) = project();
         let table_count: i64 = project.conn.query_row("SELECT count(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'chapters_fts_%'", [], |r| r.get(0)).unwrap();
-        assert_eq!(table_count, 15);
+        assert_eq!(table_count, 16);
         assert_eq!(
             project
                 .conn

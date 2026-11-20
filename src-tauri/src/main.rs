@@ -3,6 +3,7 @@
 mod catalog_commands;
 mod db;
 mod error;
+mod memory_commands;
 mod profiles;
 mod remote;
 
@@ -310,7 +311,13 @@ fn llm_stream_start(app: AppHandle, studio: State<'_, Studio>, task_id: String) 
     if streams.contains_key(&task_id) {
         return Ok(false);
     }
-    let task = studio.project(|project| project.task(&task_id))?;
+    let task = studio.project(|project| {
+        let task = project.task(&task_id)?;
+        if task.state == "queued" {
+            project.check_writer_stamp(&task)?;
+        }
+        Ok(task)
+    })?;
     if task.state != "queued" {
         return Ok(false);
     }
@@ -476,6 +483,17 @@ fn main() {
             catalog_commands::prompt_revisions,
             catalog_commands::save_prompt_revision,
             catalog_commands::list_llm_traces,
+            memory_commands::read_memory,
+            memory_commands::write_canon,
+            memory_commands::write_note,
+            memory_commands::write_knowledge,
+            memory_commands::write_memory_roles,
+            memory_commands::ingest_memory,
+            memory_commands::review_memory_fact,
+            memory_commands::refresh_memory_status,
+            memory_commands::stale_indexes,
+            memory_commands::index_chapter,
+            memory_commands::search_text,
             new_project,
             open_project,
             rename_project,

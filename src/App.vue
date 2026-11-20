@@ -1,14 +1,15 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { isTauri } from '@tauri-apps/api/core'
 import {
   ArrowDown, ArrowLeft, ArrowRight, ArrowUp, BookOpen, ChevronDown, CircleAlert,
-  Beaker, Clock3, Copy, FilePlus2, FolderOpen, Library, PanelRight, PenLine, Plus, Settings2, Sparkles, Square, X,
+  Beaker, BookMarked, Clock3, Copy, FilePlus2, FolderOpen, Library, PanelRight, PenLine, Plus, Settings2, Sparkles, Square, X,
 } from 'lucide-vue-next'
 import ModelSettings from './components/ModelSettings.vue'
 import SceneControls from './components/SceneControls.vue'
 import PacksView from './views/PacksView.vue'
 import LabView from './views/LabView.vue'
+import MemoryView from './views/MemoryView.vue'
 import { activeTask, type GenerationTask, type TaskState } from './core/contracts/types'
 import { countHan } from './core/quality/hardGate'
 import { useStudio } from './stores/studio'
@@ -19,9 +20,11 @@ const title = ref('')
 const creatingBook = ref(false)
 const chapterForm = ref(false)
 const newChapterTitle = ref('')
-const panel = ref<'draft' | 'history'>('draft')
+const panel = ref<'draft' | 'history' | 'review'>('draft')
 const showInspector = ref(true)
-const view = ref<'studio' | 'packs' | 'lab'>('studio')
+const view = ref<'studio' | 'packs' | 'lab' | 'memory'>('studio')
+const manuscript = ref<HTMLTextAreaElement>()
+const reviewEventId = ref('')
 watch(() => studio.project?.projectId, () => { view.value = 'studio' })
 const chapterProgress = computed(() => {
   const target = studio.project?.targetChapterChars ?? 2000
@@ -33,6 +36,25 @@ const states: Record<TaskState, string> = {
 }
 const recovered = computed(() => studio.currentTask && ['outcome_unknown', 'interrupted', 'failed', 'cancelled'].includes(studio.currentTask.state))
 const date = new Intl.DateTimeFormat('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
+const reviewCount = computed(() => studio.chapterFindings.filter(item => item.severity === 'severe').length
+  + studio.memory.events.filter(item => item.chapterId === studio.chapterId && item.current && item.approval === 'pending').length)
+const sync = { pending: '待同步', processing: '处理中', synced: '已同步', needs_confirm: '待确认' }
+
+async function locate(chapterId: string, quote: string, preferred?: number) {
+  if (studio.chapterId !== chapterId) await studio.openChapter(chapterId)
+  if (studio.chapterId !== chapterId || studio.error) return
+  view.value = 'studio'
+  await nextTick()
+  const editor = manuscript.value
+  if (!editor) return
+  const start = preferred !== undefined && editor.value.slice(preferred, preferred + quote.length) === quote
+    ? preferred : editor.value.indexOf(quote)
+  if (start < 0) { studio.flash('原文位置已变化'); return }
+  editor.focus()
+  editor.setSelectionRange(start, start + quote.length)
+  const line = Number.parseFloat(getComputedStyle(editor).lineHeight)
+  if (Number.isFinite(line)) editor.scrollTop = Math.max(0, (editor.value.slice(0, start).split('\n').length - 3) * line)
+}
 
 function keyboard(event: KeyboardEvent) {
   if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 's' && studio.project) {
@@ -110,6 +132,7 @@ async function copyDraft(task: GenerationTask) {
       </div>
       <nav v-if="studio.project" class="workspace-nav" aria-label="工作台导航">
         <button class="flat-button" :class="{ selected: view === 'studio' }" type="button" aria-label="写作台" @click="view = 'studio'"><PenLine :size="16" /><span>写作台</span></button>
+        <button class="flat-button" :class="{ selected: view === 'memory' }" type="button" aria-label="记忆库" @click="reviewEventId = ''; view = 'memory'"><BookMarked :size="16" /><span>记忆库</span><i v-if="studio.memoryPending" class="review-dot"></i></button>
         <button class="flat-button" :class="{ selected: view === 'packs' }" type="button" aria-label="卡带与配方" @click="view = 'packs'"><Library :size="16" /><span>配方</span></button>
         <button class="flat-button" :class="{ selected: view === 'lab' }" type="button" aria-label="实验室" @click="view = 'lab'"><Beaker :size="16" /><span>实验室</span></button>
       </nav>
@@ -144,6 +167,7 @@ async function copyDraft(task: GenerationTask) {
 
     <PacksView v-else-if="view === 'packs'" />
     <LabView v-else-if="view === 'lab'" />
+    <MemoryView v-else-if="view === 'memory'" :review-event-id="reviewEventId" @open="locate" />
     <main v-else class="studio-layout" :class="{ compact: !showInspector }">
       <aside class="chapter-pane" aria-label="章节目录">
         <div class="aside-head"><strong>章节</strong><button type="button" class="icon-button" aria-label="添加章节" @click="chapterForm = !chapterForm"><Plus :size="18" /></button></div>
@@ -181,7 +205,7 @@ async function copyDraft(task: GenerationTask) {
           <p class="micro">第 {{ studio.chapter.chapterOrder }} 章</p>
           <input :key="studio.chapter.chapterId + studio.chapter.title" :value="studio.chapter.title"
             class="chapter-title" aria-label="章节标题" maxlength="120" @blur="renameChapter" @keydown.enter="($event.target as HTMLInputElement).blur()">
-          <textarea v-model="studio.text" class="manuscript" spellcheck="false" aria-label="正文" placeholder="从一个动作、一个地点，或一句对白写起……"></textarea>
+          <textarea ref="manuscript" v-model="studio.text" class="manuscript" spellcheck="false" aria-label="正文" placeholder="从一个动作、一个地点，或一句对白写起……"></textarea>
         </div>
         <footer class="editor-footer">
           <div class="editor-meter"><span>{{ studio.currentCount }} 字</span><div class="meter" role="progressbar" :aria-valuenow="chapterProgress" aria-label="章节目标进度"><span :style="{ width: chapterProgress + '%' }"></span></div>
@@ -204,6 +228,7 @@ async function copyDraft(task: GenerationTask) {
         <nav class="inspector-tabs">
           <button :class="{ selected: panel === 'draft' }" type="button" @click="panel = 'draft'">续写草稿</button>
           <button :class="{ selected: panel === 'history' }" type="button" @click="panel = 'history'"><Clock3 :size="14" /> 版本历史</button>
+          <button :class="{ selected: panel === 'review' }" type="button" @click="panel = 'review'">审查<span v-if="reviewCount" class="pending-count">{{ reviewCount }}</span></button>
         </nav>
         <template v-if="panel === 'draft'">
           <div class="model-line">
@@ -245,12 +270,32 @@ async function copyDraft(task: GenerationTask) {
           </div>
           <div v-else class="inspector-empty"><Sparkles :size="20" /><p>续写结果会先出现在这里。</p></div>
         </template>
-        <div v-else class="history-list">
+        <div v-else-if="panel === 'history'" class="history-list">
           <button v-for="version in studio.history" :key="version.revisionId" class="history-row" type="button" @click="studio.restoreRevision(version)">
             <strong>{{ version.revisionId === studio.chapter?.currentRevisionId ? '当前正式修订' : version.saveKind === 'ai_draft' ? '保留草稿' : '正式修订' }}</strong>
             <span>{{ date.format(new Date(version.createdAt)) }} · {{ version.cjkCharCount }} 字</span>
           </button>
           <div v-if="!studio.history.length" class="inspector-empty"><Clock3 :size="20" /><p>保存修订后会显示在这里。</p></div>
+        </div>
+        <div v-else class="review-panel">
+          <div class="task-meta"><span>记忆 · {{ sync[studio.chapter?.memorySyncStatus ?? 'pending'] }}</span>
+            <button type="button" class="secondary-button" :disabled="studio.busy || !studio.chapter || !studio.text.trim()"
+              @click="studio.completeChapter()">完成本章</button></div>
+          <article v-for="finding in studio.chapterFindings" :key="finding.anchor.startOffset + finding.message" class="review-finding"
+            :class="{ severe: finding.severity === 'severe' }">
+            <strong>{{ finding.message }}</strong>
+            <button type="button" class="memory-row" @click="locate(studio.chapterId, finding.anchor.quote, finding.anchor.startOffset)">{{ finding.anchor.quote }}</button>
+            <p v-if="finding.suggestion">{{ finding.suggestion }}</p>
+          </article>
+          <p v-if="studio.chapterAudits.some(task => activeTask(task.state))" class="muted">一致性审查正在运行。</p>
+          <p v-else-if="studio.chapterAudits.some(task => task.state === 'completed') && !studio.chapterFindings.length" class="muted">本次审查没有可定位的告警。</p>
+          <div v-for="task in studio.chapterAnalysis.filter(item => item.state === 'queued')" :key="task.taskId" class="memory-actions">
+            <button type="button" class="secondary-button" :disabled="studio.busy" @click="studio.startQueued(task)">发送{{ task.taskType === 'consistency_check' ? '审查' : '提取' }}</button>
+            <button type="button" class="flat-button" :disabled="studio.busy" @click="studio.cancel(task)">取消</button>
+          </div>
+          <p v-for="task in studio.chapterAnalysis.filter(item => studio.writingIssues[item.taskId])" :key="task.taskId" class="pending-text">{{ studio.writingIssues[task.taskId] }}</p>
+          <button v-for="fact in studio.memory.events.filter(item => item.chapterId === studio.chapterId && item.current && item.approval === 'pending')"
+            :key="fact.eventId" type="button" class="memory-row" @click="reviewEventId = fact.eventId; view = 'memory'"><strong class="pending-text">待确认</strong>{{ fact.summary }}</button>
         </div>
       </aside>
     </main>

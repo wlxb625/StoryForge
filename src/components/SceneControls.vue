@@ -6,7 +6,7 @@ import { useStudio } from '../stores/studio'
 
 const studio = useStudio()
 const editingExisting = ref(true)
-const form = reactive({ title: '', time: '', location: '', cast: '', conflict: '' })
+const form = reactive({ title: '', time: '', location: '', cast: '', conflict: '', povCharacterId: '' })
 const fields = [
   ['goal', '戏剧目的'], ['hiddenGoal', '潜在目的'], ['action', '表层行为'],
   ['emotion', '内在情绪'], ['dialogue', '对话状态'], ['pace', '节奏变化'], ['pov', '视角限制'],
@@ -18,7 +18,7 @@ const techniques = computed(() => studio.styles.packs.filter(pack => pack.slot =
 function load() {
   const scene = editingExisting.value ? studio.scene : undefined
   Object.assign(form, { title: scene?.title ?? '', time: scene?.details.time ?? '', location: scene?.details.location ?? '',
-    cast: scene?.details.cast ?? '', conflict: scene?.details.conflict ?? '' })
+    cast: scene?.details.cast ?? '', conflict: scene?.details.conflict ?? '', povCharacterId: scene?.details.povCharacterId ?? '' })
   for (const [key] of fields) intent[key] = scene?.details.intent?.[key] ?? ''
   intent.humor = scene?.details.intent?.humor
   chosen.value = [...(scene?.details.techniqueIds ?? [])]
@@ -34,7 +34,7 @@ function save() {
   if (!form.title.trim()) return
   void studio.saveScene({ sceneId: current?.sceneId, version: current?.version, title: form.title,
     details: { time: form.time, location: form.location, cast: form.cast, conflict: form.conflict,
-      intent: { ...intent }, techniqueIds: chosen.value },
+      intent: { ...intent }, techniqueIds: chosen.value, povCharacterId: form.povCharacterId || undefined },
   })
 }
 function toggle(id: string) {
@@ -63,6 +63,12 @@ function toggle(id: string) {
           <label>时间<input v-model="form.time" placeholder="沿用前情"></label>
           <label>地点<input v-model="form.location" placeholder="沿用前情"></label>
           <label>在场人物<input v-model="form.cast" placeholder="用顿号分隔"></label>
+          <label>视角人物
+            <select v-model="form.povCharacterId">
+              <option value="">未指定</option>
+              <option v-for="person in studio.memory.canon.filter(item => item.category === 'character')" :key="person.entryId" :value="person.entryId">{{ person.name }}</option>
+            </select>
+          </label>
           <label>核心矛盾<textarea v-model="form.conflict" rows="2"></textarea></label>
           <label v-for="[key,label] in fields" :key="key">{{ label }}<input v-model="intent[key]" :placeholder="studio.sceneIntent[key]"></label>
           <label>幽默许可

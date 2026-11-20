@@ -12,6 +12,9 @@ import { countHan, technicalIssue } from '../core/quality/hardGate'
 import { taskService } from '../core/tasks/service'
 import { builtins } from '../core/skills/builtins'
 import { skillExtraction } from '../core/skills/extraction'
+import { cjkIndex, cjkQuery } from '../core/db/fts'
+import { auditFindings, emptyMemory, extractCandidates, memoryAnalysis, writerMemory,
+  type Audience, type Canon, type Fact, type Knowledge, type MemoryRoles, type Note } from '../core/narrative/memory'
 
 export const useStudio = defineStore('studio', () => {
   const project = ref<Project | null>(null)
@@ -34,6 +37,8 @@ export const useStudio = defineStore('studio', () => {
   const scenes = ref<Scene[]>([])
   const promptHistory = ref<PromptRevision[]>([])
   const traces = ref<Trace[]>([])
+  const memory = ref(emptyMemory())
+  let indexing: Promise<void> | undefined
   const subscriptions = new Map<string, () => void>()
   let bufferTimer: ReturnType<typeof setTimeout> | undefined
   let noticeTimer: ReturnType<typeof setTimeout> | undefined
@@ -50,6 +55,16 @@ export const useStudio = defineStore('studio', () => {
   const scene = computed(() => scenes.value.find((item) => item.sceneId === chapter.value?.activeSceneId))
   const sceneIntent = computed(() => deriveIntent(scene.value, draftHint.value, acceptedText.value))
   const sceneStyles = computed(() => activeStyles(styles.value, scene.value, sceneIntent.value, draftHint.value))
+  const memoryPending = computed(() => memory.value.events.filter(event => event.approval === 'pending' && event.current).length)
+  const chapterAnalysis = computed(() => tasks.value.filter(task => task.chapterId === chapterId.value
+    && task.baseRevisionId === chapter.value?.currentRevisionId && ['memory_extract', 'consistency_check'].includes(task.taskType)))
+  const chapterAudits = computed(() => chapterAnalysis.value.filter(task => task.taskType === 'consistency_check'))
+  const chapterFindings = computed(() => {
+    const task = chapterAudits.value.find(entry => entry.state === 'completed')
+    try {
+      return task ? auditFindings(task.partialOutput, acceptedText.value) : []
+    } catch { return [] }
+  })
 
   function flash(message: string) {
     notice.value = message
@@ -91,16 +106,26 @@ export const useStudio = defineStore('studio', () => {
   async function loadWorkspace(result: Project) {
     resetSubscriptions()
     project.value = result
-    const [catalog, savedScenes, prompts, storedTasks] = await Promise.all([
-      desktop.writePacks(builtins, true), desktop.scenes(), desktop.prompts(), desktop.tasks(), readChapters(),
+    const [catalog, savedScenes, prompts, storedTasks, savedMemory] = await Promise.all([
+      desktop.writePacks(builtins, true), desktop.scenes(), desktop.prompts(), desktop.tasks(), desktop.memory(), readChapters(),
     ])
     styles.value = catalog
     scenes.value = savedScenes
     promptHistory.value = prompts
     tasks.value = storedTasks
     writingIssues.value = {}
+    memory.value = savedMemory
     for (const task of tasks.value.filter((item) => activeTask(item.state))) watchTask(task)
+    const currentRevisions = new Set(chapters.value.map(item => item.currentRevisionId))
+    for (const task of storedTasks) {
+      const unprocessedExtraction = task.taskType === 'memory_extract' && task.state === 'completed'
+        && !savedMemory.ingested.some(([id]) => id === task.taskId)
+      const currentAnalysis = ['memory_extract', 'consistency_check'].includes(task.taskType)
+        && currentRevisions.has(task.baseRevisionId) && !activeTask(task.state)
+      if (unprocessedExtraction || currentAnalysis) await settleAnalysis(task)
+    }
     await readChapter(chapters.value[0]?.chapterId ?? '')
+    background(indexManuscript())
   }
 
   function openWorkspace(title?: string) {
@@ -127,6 +152,7 @@ export const useStudio = defineStore('studio', () => {
       project.value = null
       chapterId.value = ''
       tasks.value = []
+      memory.value = emptyMemory()
     })
   }
 
@@ -231,6 +257,8 @@ export const useStudio = defineStore('studio', () => {
     entry.currentRevisionId = revision.revisionId
     entry.status = 'accepted'
     revisions.value.unshift(revision)
+    entry.memorySyncStatus = 'pending'
+    background(indexManuscript())
     flash('已保存正式修订')
   }
 
@@ -248,7 +276,7 @@ export const useStudio = defineStore('studio', () => {
     if (event.payload.text) task.partialOutput += event.payload.text
     if (event.payload.state) task.state = event.payload.state
     if (event.payload.message) writingIssues.value[task.taskId] = event.payload.message
-    if (task.taskType !== 'skill_extract' && (event.eventType === 'token' || event.eventType === 'completed')) {
+    if ((task.taskType === 'beat_write' || task.taskType === 'ab_write') && (event.eventType === 'token' || event.eventType === 'completed')) {
       const issue = technicalIssue(task.partialOutput, event.eventType === 'completed', event.payload.finishReason)
       if (issue && !writingIssues.value[task.taskId]) {
         writingIssues.value[task.taskId] = issue
@@ -259,6 +287,7 @@ export const useStudio = defineStore('studio', () => {
       subscriptions.get(task.taskId)?.()
       subscriptions.delete(task.taskId)
       void refreshTraces().catch(() => {})
+      if (task.taskType === 'memory_extract' || task.taskType === 'consistency_check') background(settleAnalysis(task))
     }
   }
 
@@ -277,9 +306,7 @@ export const useStudio = defineStore('studio', () => {
     if (currentActive.value) throw new Error('该章已有待处理任务。')
     await saveText()
     const revision = revisions.value.find((item) => item.revisionId === entry.currentRevisionId)
-    const frozenContext = freezeContext(book, entry, revision, profile, instruction, carryDraft, {
-      scene: scene.value, catalog: styles.value, promptRevision: promptHistory.value[0],
-    })
+    const frozenContext = freezeContext(book, entry, revision, profile, instruction, carryDraft, await writerSources(entry, instruction))
     const task = await makeTask(entry, 'beat_write', frozenContext)
     taskId.value = task.taskId
     await taskService.startTask(task.taskId)
@@ -361,9 +388,7 @@ export const useStudio = defineStore('studio', () => {
       const source = revisions.value.find(revision => revision.revisionId === entry.currentRevisionId)
       const ids: ['A' | 'B', 'A' | 'B'] = (crypto.getRandomValues(new Uint8Array(1))[0] ?? 0) % 2 ? ['A', 'B'] : ['B', 'A']
       const id = crypto.randomUUID()
-      const shared = freezeContext(book, entry, source, a, instruction, '', {
-        scene: scene.value, catalog: styles.value, promptRevision: promptHistory.value[0],
-      })
+      const shared = freezeContext(book, entry, source, a, instruction, '', await writerSources(entry, instruction))
       const first = await makeTask(entry, 'ab_write', { ...shared, comparison: { id, label: ids[0] } }, id + ':' + ids[0])
       const second = await makeTask(entry, 'ab_write', { ...retarget(shared, b), comparison: { id, label: ids[1] } }, id + ':' + ids[1])
       await Promise.all([taskService.startTask(first.taskId), taskService.startTask(second.taskId)])
@@ -417,7 +442,140 @@ export const useStudio = defineStore('studio', () => {
       await readChapters()
       await readChapter(task.chapterId)
       flash(`已采纳为正式修订 · ${revision.cjkCharCount} 字`)
+      background(indexManuscript())
+      if (chapter.value && bookHasReachedTarget(revision)) await analyzeChapter(chapter.value, revision, true)
     })
+  }
+
+  function background(work: Promise<unknown>) {
+    void work.catch(problem => { error.value = errorMessage(problem) })
+  }
+
+  function bookHasReachedTarget(revision: Revision) {
+    return !!project.value && revision.cjkCharCount >= project.value.targetChapterChars
+  }
+
+  async function refreshMemory() {
+    memory.value = await desktop.memory()
+    return memory.value
+  }
+
+  async function writerSources(entry: Chapter, instruction: string) {
+    const snapshot = await refreshMemory()
+    const activeScene = scenes.value.find(item => item.sceneId === entry.activeSceneId)
+    const scoped = writerMemory(snapshot, entry, activeScene?.details.povCharacterId)
+    const terms = [...new Set(scoped.searchableNames)].filter(name => instruction.includes(name) && cjkQuery(name)).slice(0, 5)
+    if (terms.length) await indexManuscript()
+    const hits = await Promise.all(terms.map(name => desktop.searchText(cjkQuery(name), name)))
+    return { scene: activeScene, catalog: styles.value, promptRevision: promptHistory.value[0], memory: snapshot,
+      memoryMatches: hits.flatMap(rows => rows.map(row => row.chapterId)) }
+  }
+
+  async function settleAnalysis(task: GenerationTask) {
+    if (!task.baseRevisionId) return
+    if (task.state !== 'completed' && !activeTask(task.state) && !writingIssues.value[task.taskId]) {
+      const last = (await desktop.events(task.taskId, Math.max(0, task.lastEventSeq - 2))).at(-1)
+      if (last?.payload.message) writingIssues.value[task.taskId] = last.payload.message
+    }
+    if (task.taskType === 'memory_extract' && task.state === 'completed' && !memory.value.ingested.some(([id]) => id === task.taskId)) {
+      const revision = (await desktop.revisions(task.chapterId)).find(item => item.revisionId === task.baseRevisionId)
+      if (!revision) return
+      let result
+      try { result = extractCandidates(task.partialOutput, revision.content) }
+      catch { result = { candidates: [], problem: '模型返回的候选无法解析。可重新提取。' } }
+      await desktop.ingestMemory(task.taskId, result.candidates, result.problem)
+      await refreshMemory()
+    }
+    if (task.state === 'completed' && task.taskType === 'consistency_check') {
+      const revision = (await desktop.revisions(task.chapterId)).find(item => item.revisionId === task.baseRevisionId)
+      if (revision) {
+        try { auditFindings(task.partialOutput, revision.content) }
+        catch { writingIssues.value[task.taskId] = '审查报告格式有误。可重新审查。' }
+      }
+    }
+    await desktop.refreshMemoryStatus(task.chapterId, task.baseRevisionId)
+    const updated = (await desktop.chapters()).find(item => item.chapterId === task.chapterId)
+    const local = chapters.value.find(item => item.chapterId === task.chapterId)
+    if (local?.currentRevisionId === updated?.currentRevisionId && local) local.memorySyncStatus = updated?.memorySyncStatus
+  }
+
+  async function analyzeChapter(entry: Chapter, revision: Revision, automatic: boolean) {
+    const book = project.value
+    if (!book) return
+    const current = await refreshMemory()
+    const roles = [
+      ['consistency_check', current.roles.auditProfileId], ['memory_extract', current.roles.extractionProfileId],
+    ] as const
+    const usable = (profile: ModelProfile) => !profile.needsKey || profile.hasKey
+    const plans = roles.map(([kind, id]) => {
+      const configured = profiles.value.find(profile => profile.id === id && usable(profile))
+      const fallback = !automatic && !id ? selectedProfile.value : undefined
+      return { kind, profile: configured ?? (fallback && usable(fallback) ? fallback : undefined) }
+    }).filter(({ profile }) => profile !== undefined)
+    if (!plans.length) {
+      if (!automatic) throw new Error('请在记忆库配置审查与提取模型，或选择一个可用模型。')
+      return
+    }
+    if (automatic && plans.length < 2) return
+    const previous = tasks.value.filter(task => task.baseRevisionId === revision.revisionId)
+    const pending = plans.filter(({ kind }) => !previous.some(task => task.taskType === kind &&
+      (activeTask(task.state) || automatic || (task.state === 'completed' &&
+        !writingIssues.value[task.taskId] && !current.ingested.some(([id, problem]) => id === task.taskId && problem)))))
+    if (!pending.length) return
+    const pov = scenes.value.find(item => item.sceneId === entry.activeSceneId)?.details.povCharacterId
+    const analysisTasks = await Promise.all(pending.map(({ kind, profile }) =>
+      makeTask(entry, kind, memoryAnalysis(kind, book, entry, revision, profile!, current, pov))))
+    const started = await Promise.allSettled(analysisTasks.map(task => taskService.startTask(task.taskId)))
+    for (const [index, result] of started.entries()) {
+      if (result.status === 'fulfilled') continue
+      const task = analysisTasks[index]
+      if (task) await taskService.cancelTask(task.taskId, errorMessage(result.reason))
+    }
+    await desktop.refreshMemoryStatus(entry.chapterId, revision.revisionId)
+    const latest = (await desktop.chapters()).find(item => item.chapterId === entry.chapterId)
+    if (latest?.currentRevisionId === entry.currentRevisionId) entry.memorySyncStatus = latest?.memorySyncStatus
+  }
+
+  function completeChapter() {
+    return run(async () => {
+      await saveText()
+      const entry = chapter.value
+      const revision = revisions.value.find(item => item.revisionId === entry?.currentRevisionId)
+      if (!entry || !revision?.content.trim()) throw new Error('请先保存本章正文。')
+      await analyzeChapter(entry, revision, false)
+    })
+  }
+
+  function indexManuscript() {
+    if (indexing) return indexing
+    const scope = project.value?.projectId
+    indexing = (async () => {
+      while (scope && scope === project.value?.projectId) {
+        const batch = await desktop.staleIndexes()
+        if (!batch.length) return
+        for (const entry of batch) {
+          if (scope !== project.value?.projectId) return
+          await desktop.indexChapter(entry.chapterId, entry.revisionId, cjkIndex(entry.content))
+        }
+      }
+    })().finally(() => { indexing = undefined })
+    return indexing
+  }
+
+  async function searchManuscript(text: string) {
+    const exact = text.trim()
+    const phrase = cjkQuery(exact)
+    if (!phrase) return []
+    await indexManuscript()
+    return desktop.searchText(phrase, exact)
+  }
+
+  function saveCanon(entry: Canon) { return run(async () => { await desktop.writeCanon(entry); await refreshMemory(); flash('设定已存入工程') }) }
+  function saveNote(note: Note) { return run(async () => { await desktop.writeNote(note); await refreshMemory(); flash('备注已保存') }) }
+  function saveKnowledge(entry: Knowledge) { return run(async () => { await desktop.writeKnowledge(entry); await refreshMemory(); flash('已保存人物知情状态') }) }
+  function saveRoles(roles: MemoryRoles) { return run(async () => { await desktop.writeMemoryRoles(roles); await refreshMemory(); flash('已保存模型分工') }) }
+  function reviewFact(fact: Fact, action: 'accept' | 'reject' | 'undo', audience?: Audience) {
+    return run(async () => { await desktop.reviewFact(fact.eventId, action, audience); await refreshMemory(); await readChapters() })
   }
 
   return {
@@ -427,5 +585,7 @@ export const useStudio = defineStore('studio', () => {
     renameChapter, moveChapter, archiveSelected, restoreChapter, saveCurrent, restoreRevision, generate, startQueued,
     cancel, resumeTask, acceptDraft, flash, styles, scenes, scene, sceneIntent, sceneStyles, promptHistory, traces,
     setStyle, togglePack, importPacks, saveScene, selectScene, savePrompt, refreshTraces, runSkillExtraction, compareModels,
+    memory, memoryPending, chapterFindings, chapterAudits, chapterAnalysis, saveCanon, saveNote, saveKnowledge, saveRoles, reviewFact, completeChapter,
+    searchManuscript,
   }
 })

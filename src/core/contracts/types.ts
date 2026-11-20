@@ -60,6 +60,7 @@ export interface Chapter {
   currentRevisionId: string | null
   status: string
   activeSceneId?: string | null
+  memorySyncStatus?: 'pending' | 'processing' | 'synced' | 'needs_confirm'
 }
 
 export interface Revision {
@@ -88,6 +89,7 @@ export interface FrozenContext {
   previousRevisionIds: string[]
   chapterTitle: string
   canonVersions: Record<string, number>
+  memoryStamp?: string
   skillVersions: Record<string, string>
   targetBeatChars: number
   instruction: string
@@ -109,7 +111,7 @@ export interface TaskInput {
   idempotencyKey: string
   chapterId: string
   baseRevisionId: string | null
-  taskType: 'beat_write' | 'ab_write' | 'skill_extract'
+  taskType: 'beat_write' | 'ab_write' | 'skill_extract' | 'memory_extract' | 'consistency_check'
   frozenContext: FrozenContext
 }
 
@@ -166,6 +168,7 @@ export interface SceneDetails {
   conflict: string
   intent?: Partial<SceneIntent>
   techniqueIds?: string[]
+  povCharacterId?: string
 }
 export interface Scene { sceneId: string; title: string; version: number; details: SceneDetails }
 export type SceneInput = Partial<Pick<Scene, 'sceneId' | 'version'>> & Pick<Scene, 'title' | 'details'>
