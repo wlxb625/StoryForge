@@ -10,6 +10,7 @@ import { freezeContext, retarget } from '../core/narrative/freeze'
 import { activeStyles, deriveIntent } from '../core/narrative/intent'
 import { countHan, technicalIssue } from '../core/quality/hardGate'
 import { taskService } from '../core/tasks/service'
+import type { Batch, BatchInput } from '../core/tasks/batch'
 import { builtins } from '../core/skills/builtins'
 import { skillExtraction } from '../core/skills/extraction'
 import { cjkIndex, cjkQuery } from '../core/db/fts'
@@ -41,6 +42,9 @@ export const useStudio = defineStore('studio', () => {
   const traces = ref<Trace[]>([])
   const memory = ref(emptyMemory())
   const arcs = ref<StageArc[]>([])
+  const batch = ref<Batch | null>(null)
+  let pumping = false
+  let pumpRequested = false
   const editImpact = ref<{ revisionId: string; hits: SearchHit[]; terms: string[] }>()
   let indexing: Promise<void> | undefined
   const subscriptions = new Map<string, () => void>()
@@ -118,8 +122,8 @@ export const useStudio = defineStore('studio', () => {
   async function loadWorkspace(result: Project) {
     resetSubscriptions()
     project.value = result
-    const [catalog, savedScenes, prompts, storedTasks, savedMemory, savedArcs] = await Promise.all([
-      desktop.writePacks(builtins, true), desktop.scenes(), desktop.prompts(), desktop.tasks(), desktop.memory(), desktop.arcs(), readChapters(),
+    const [catalog, savedScenes, prompts, storedTasks, savedMemory, savedArcs, savedBatch] = await Promise.all([
+      desktop.writePacks(builtins, true), desktop.scenes(), desktop.prompts(), desktop.tasks(), desktop.memory(), desktop.arcs(), desktop.latestBatch(), readChapters(),
     ])
     styles.value = catalog
     scenes.value = savedScenes
@@ -128,10 +132,15 @@ export const useStudio = defineStore('studio', () => {
     writingIssues.value = {}
     memory.value = savedMemory
     arcs.value = savedArcs
+    batch.value = savedBatch
     editImpact.value = undefined
     for (const task of tasks.value.filter((item) => activeTask(item.state))) watchTask(task)
     const currentRevisions = new Set(chapters.value.map(item => item.currentRevisionId))
     for (const task of storedTasks) {
+      if (task.state === 'queued' && task.frozenContext.batchId && task.taskId !== savedBatch?.step?.taskId) {
+        await taskService.cancelTask(task.taskId)
+        continue
+      }
       const unprocessedExtraction = task.taskType === 'memory_extract' && task.state === 'completed'
         && !savedMemory.ingested.some(([id]) => id === task.taskId)
       const currentAnalysis = ['memory_extract', 'consistency_check'].includes(task.taskType)
@@ -140,6 +149,7 @@ export const useStudio = defineStore('studio', () => {
     }
     await readChapter(chapters.value[0]?.chapterId ?? '')
     background(indexManuscript())
+    kickBatch()
   }
 
   function openWorkspace(title?: string) {
@@ -168,6 +178,7 @@ export const useStudio = defineStore('studio', () => {
       tasks.value = []
       memory.value = emptyMemory()
       arcs.value = []
+      batch.value = null
       editImpact.value = undefined
     })
   }
@@ -295,7 +306,7 @@ export const useStudio = defineStore('studio', () => {
     if (event.payload.text) task.partialOutput += event.payload.text
     if (event.payload.state) task.state = event.payload.state
     if (event.payload.message) writingIssues.value[task.taskId] = event.payload.message
-    if ((task.taskType === 'beat_write' || task.taskType === 'ab_write') && (event.eventType === 'token' || event.eventType === 'completed')) {
+    if (['beat_write','ab_write','batch_write'].includes(task.taskType) && (event.eventType === 'token' || event.eventType === 'completed')) {
       const issue = technicalIssue(task.partialOutput, event.eventType === 'completed', event.payload.finishReason)
       if (issue && !writingIssues.value[task.taskId]) {
         writingIssues.value[task.taskId] = issue
@@ -306,7 +317,8 @@ export const useStudio = defineStore('studio', () => {
       subscriptions.get(task.taskId)?.()
       subscriptions.delete(task.taskId)
       void refreshTraces().catch(() => {})
-      if (task.taskType === 'memory_extract' || task.taskType === 'consistency_check') background(settleAnalysis(task))
+      if (task.frozenContext.batchId) kickBatch()
+      else if (task.taskType === 'memory_extract' || task.taskType === 'consistency_check') background(settleAnalysis(task))
     }
   }
 
@@ -561,6 +573,142 @@ export const useStudio = defineStore('studio', () => {
     return run(async () => { await desktop.applyPivot(pivot); arcs.value = await desktop.arcs(); flash('已确认改纲') })
   }
 
+  function exportBook(format: 'story' | 'docx' | 'epub') {
+    return run(async () => {
+      if (dirty.value) throw new Error('请先保存当前正文。')
+      const path = await desktop.exportProject(format)
+      if (path) flash('已导出 ' + path.split(/[\\/]/).at(-1))
+    })
+  }
+
+  function startBatch(input: BatchInput) {
+    return run(async () => {
+      if (dirty.value) throw new Error('请先保存当前正文。')
+      batch.value = await desktop.startBatch(input)
+      kickBatch()
+    })
+  }
+  function controlBatch(action: 'pause' | 'resume' | 'stop', budget?: number) {
+    return run(async () => {
+      if (!batch.value) return
+      if (action === 'stop' && batch.value.step) {
+        const task = await desktop.task(batch.value.step.taskId)
+        if (task.state === 'queued') await taskService.cancelTask(task.taskId)
+        else throw new Error('请等当前模型请求结算，再结束批次。')
+        await processCompletedBatchStep(batch.value, await desktop.task(task.taskId))
+      }
+      batch.value = await desktop.controlBatch(batch.value.batchId, action, budget)
+      kickBatch()
+    })
+  }
+
+  async function processCompletedBatchStep(current: Batch, task: GenerationTask) {
+    let problem = writingIssues.value[task.taskId] ?? ''
+    let passed = task.state === 'completed' && !problem
+    if (passed && task.taskType === 'batch_write') {
+      const completed = (await desktop.events(task.taskId, Math.max(0, task.lastEventSeq - 2))).find(event => event.eventType === 'completed')
+      problem = technicalIssue(task.partialOutput, true, completed?.payload.finishReason) ?? ''
+      if (chapterId.value === task.chapterId && dirty.value) problem = '作者正在编辑本章。请保存并查看后台草稿，再决定是否继续。'
+      if (!problem) {
+        try {
+          const revision = await desktop.adoptBatchDraft(current.batchId, task.taskId)
+          await readChapters()
+          if (chapterId.value === task.chapterId && !dirty.value) await readChapter(task.chapterId)
+          await desktop.indexChapter(task.chapterId, revision.revisionId, cjkIndex(revision.content))
+        } catch (failure) { problem = errorMessage(failure) }
+      }
+      passed = !problem
+    }
+    if (passed && (task.taskType === 'consistency_check' || task.taskType === 'memory_extract')) {
+      await settleAnalysis(task)
+      if (task.taskType === 'consistency_check') {
+        const source = (await desktop.revisions(task.chapterId)).find(item => item.revisionId === task.baseRevisionId)
+        try {
+          const findings = auditFindings(task.partialOutput, source?.content ?? '')
+          if (findings.some(finding => finding.severity === 'severe')) problem = '出现重大一致性告警。请到本章审查面板处理后再继续。'
+        } catch { problem = '一致性审查报告无法解析'; passed = false }
+      } else {
+        problem = memory.value.ingested.find(([id]) => id === task.taskId)?.[1] ?? ''
+        if (problem) passed = false
+      }
+    }
+    batch.value = await desktop.settleBatchStep(current.batchId, task.taskId, problem, passed)
+  }
+
+  function kickBatch() {
+    if (!batch.value || !project.value) return
+    pumpRequested = true
+    if (pumping) return
+    pumping = true
+    background((async () => {
+      while (pumpRequested) {
+        pumpRequested = false
+        try { await runBatchStep() }
+        catch (failure) {
+          const current = batch.value
+          if (current?.state === 'running') batch.value = await desktop.controlBatch(current.batchId, 'pause', undefined, errorMessage(failure))
+          else throw failure
+        }
+      }
+    })().finally(() => { pumping = false; if (pumpRequested) kickBatch() }))
+  }
+
+  async function runBatchStep() {
+    const book = project.value
+    if (!book) return
+    const current = await desktop.latestBatch()
+    if (project.value?.projectId !== book.projectId) return
+    batch.value = current
+    if (!current || !['running','paused'].includes(current.state)) return
+    if (current.step) {
+      const task = await desktop.task(current.step.taskId)
+      if (task.state === 'queued' && current.state === 'running') {
+        watchTask(task)
+        try { await taskService.startTask(task.taskId) }
+        catch (failure) {
+          await taskService.cancelTask(task.taskId, errorMessage(failure))
+          await processCompletedBatchStep(current, await desktop.task(task.taskId))
+        }
+      } else if (!activeTask(task.state)) {
+        await processCompletedBatchStep(current, task)
+        pumpRequested = batch.value?.state === 'running'
+      } else if (task.state !== 'queued') watchTask(task)
+      return
+    }
+    if (current.state !== 'running') return
+    const entry = (await desktop.chapters()).find(item => item.chapterId === current.chapterIds[current.cursor])
+    if (!entry) throw new Error('待连写章节已经归档或移除。')
+    if (chapterId.value === entry.chapterId && dirty.value) throw new Error('请先保存本章正在编辑的文字。')
+    const source = entry.currentRevisionId ? (await desktop.revisions(entry.chapterId)).find(item => item.revisionId === entry.currentRevisionId) : undefined
+    if (current.phase === 'advance' || (current.phase === 'extract' && current.auditedRevisionId !== entry.currentRevisionId)
+      || (current.phase === 'write' && source && bookHasReachedTarget(source))) {
+      batch.value = await desktop.advanceBatch(current.batchId)
+      pumpRequested = batch.value.state === 'running'
+      return
+    }
+    const profileId = current.phase === 'write' ? current.writerProfile : current.phase === 'audit' ? current.auditProfile : current.extractionProfile
+    const profile = (await desktop.profiles()).find(item => item.id === profileId && item.rates && (!item.needsKey || item.hasKey))
+    if (!profile) throw new Error('后台批次的模型档案或价格已变化，请检查模型设置。')
+    const kind = current.phase === 'write' ? 'batch_write' : current.phase === 'audit' ? 'consistency_check' : 'memory_extract'
+    if (kind !== 'batch_write' && !source) throw new Error('后台检查需要正式修订。')
+    const frozen = kind === 'batch_write'
+      ? freezeContext(book, entry, source, profile, current.instruction, '', await writerSources(entry, current.instruction))
+      : memoryAnalysis(kind, book, entry, source!, profile, await refreshMemory(),
+        scenes.value.find(scene => scene.sceneId === entry.activeSceneId)?.details.povCharacterId)
+    const task = await makeTask(entry,kind,{ ...frozen, batchId: current.batchId })
+    try {
+      batch.value = await desktop.reserveBatchStep(current.batchId,task.taskId,profile.id)
+    } catch (failure) {
+      await taskService.cancelTask(task.taskId)
+      throw failure
+    }
+    if (!batch.value.step) {
+      await taskService.cancelTask(task.taskId)
+      return
+    }
+    pumpRequested = true
+  }
+
   async function settleAnalysis(task: GenerationTask) {
     if (!task.baseRevisionId) return
     if (task.state !== 'completed' && !activeTask(task.state) && !writingIssues.value[task.taskId]) {
@@ -678,5 +826,6 @@ export const useStudio = defineStore('studio', () => {
     memory, memoryPending, chapterFindings, chapterAudits, chapterAnalysis, saveCanon, saveNote, saveKnowledge, saveRoles, reviewFact, completeChapter,
     searchManuscript,
     arcs, saveArc, assignArc, applyPivot, editImpact, polishTasks, requestPolish, applyPolish, criticTasks, criticFindings, requestCritic,
+    batch, startBatch, controlBatch, exportBook,
   }
 })

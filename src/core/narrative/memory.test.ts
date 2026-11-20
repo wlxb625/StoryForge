@@ -83,3 +83,20 @@ it('中文叠字和增补区编码保留，切词始终停在标点及非汉字�
   expect(cjkIndex('周宁、𠮷利')).toBe(cjkQuery('周宁') + ' gap ' + cjkQuery('𠮷利'))
   expect(cjkQuery('周，宁')).toBe('')
 })
+
+it('在 100 章事实中保留最近线索和指定检索命中，限制主笔上下文', () => {
+  const memory = emptyMemory()
+  const base = adversarialMemory().events[0]!
+  memory.events = Array.from({ length: 100 }, (_, index) => ({
+    ...base, eventId: 'event-' + index, chapterId: 'chapter-' + index, chapterOrder: index + 1,
+    eventType: 'plot_event', summary: '第' + (index + 1) + '次渡船启程' + '夜色很深。'.repeat(12),
+    audience: { ...emptyAudience(), scope: 'public' },
+  }))
+  memory.events.push({ ...base, chapterOrder: 78 })
+  const destination = { ...chapter, chapterOrder: 100 }
+  const writer = writerMemory(memory, destination, undefined, ['chapter-0'])
+  expect(writer.context.length).toBeLessThanOrEqual(12_000)
+  expect(writer.context).toContain('第1次渡船启程')
+  expect(writer.context).toContain('第100次渡船启程')
+  expect(writer.context).not.toContain('调包账本')
+})

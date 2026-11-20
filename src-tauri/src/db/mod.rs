@@ -15,6 +15,7 @@ use uuid::Uuid;
 
 use crate::error::{Result, StudioError};
 
+pub mod batch;
 pub mod catalog;
 pub mod editing;
 pub mod memory;
@@ -237,13 +238,13 @@ impl Project {
                 |row| row.get(0),
             )
             .map_err(|_| StudioError::new(400, "这个文件不是有效的 StoryForge 工程"))?;
-        if !(1..=4).contains(&version) {
+        if !(1..=5).contains(&version) {
             return Err(StudioError::new(409, "工程版本与当前应用不兼容"));
         }
         conn.execute_batch(
             "PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;",
         )?;
-        if version < 4 {
+        if version < 5 {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let current: i64 =
                 tx.query_row("SELECT schema_version FROM project_meta LIMIT 1", [], |r| {
@@ -260,6 +261,10 @@ impl Project {
             if current < 4 {
                 tx.execute_batch(include_str!("004_editing.sql"))?;
                 tx.execute("UPDATE project_meta SET schema_version=4", [])?;
+            }
+            if current < 5 {
+                tx.execute_batch(include_str!("005_batch.sql"))?;
+                tx.execute("UPDATE project_meta SET schema_version=5", [])?;
             }
             tx.commit()?;
         }
@@ -463,8 +468,10 @@ impl Project {
                     .as_deref()
                     .ok_or_else(|| StudioError::new(400, "缺少生成任务"))?;
                 let task = find_task(&tx, task_id)?;
-                if !matches!(task.task_type.as_str(), "beat_write" | "ab_write")
-                    || task.chapter_id != input.chapter_id
+                if !matches!(
+                    task.task_type.as_str(),
+                    "beat_write" | "ab_write" | "batch_write"
+                ) || task.chapter_id != input.chapter_id
                     || task.base_revision_id != base
                 {
                     return Err(StudioError::new(
@@ -544,6 +551,10 @@ impl Project {
                 memory_sync_status=CASE WHEN ?4='surface' AND memory_sync_status!='processing' THEN memory_sync_status ELSE 'pending' END,
                 updated_at=?2 WHERE chapter_id=?3",
                 params![revision.revision_id, revision.created_at, input.chapter_id,revision.edit_level])?;
+            if let Some(task_id) = input.draft_task_id.filter(|_| source_tag == "ai_gen") {
+                tx.execute("UPDATE batch_steps SET adopted_revision_id=?1 WHERE task_id=?2 AND settled_usd IS NULL",
+                    params![revision.revision_id,task_id])?;
+            }
         }
         tx.commit()?;
         Ok(revision)
@@ -561,6 +572,7 @@ impl Project {
                     | "consistency_check"
                     | "polish_span"
                     | "critic"
+                    | "batch_write"
             )
         {
             return Err(StudioError::new(400, "无效的节拍生成请求"));
@@ -917,7 +929,7 @@ mod tests {
     fn story_schema_wal_and_chapter_ids_survive_editing_order() {
         let (_temp, mut project, first) = project();
         let table_count: i64 = project.conn.query_row("SELECT count(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'chapters_fts_%'", [], |r| r.get(0)).unwrap();
-        assert_eq!(table_count, 17);
+        assert_eq!(table_count, 19);
         assert_eq!(
             project
                 .conn

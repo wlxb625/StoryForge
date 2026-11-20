@@ -346,11 +346,13 @@ impl Project {
     }
 
     pub fn check_writer_stamp(&self, task: &super::Task) -> Result<()> {
-        if matches!(task.task_type.as_str(), "beat_write" | "ab_write")
-            && task.frozen_context["memoryStamp"]
-                .as_str()
-                .unwrap_or_default()
-                != self.memory()?.stamp
+        if matches!(
+            task.task_type.as_str(),
+            "beat_write" | "ab_write" | "batch_write"
+        ) && task.frozen_context["memoryStamp"]
+            .as_str()
+            .unwrap_or_default()
+            != self.memory()?.stamp
         {
             return Err(StudioError::new(
                 409,
@@ -505,7 +507,7 @@ impl Project {
         let manuscript: Vec<u16> = source.encode_utf16().collect();
         let known = read_canon(&tx)?;
         let mut candidate_keys = HashSet::new();
-        for candidate in candidates {
+        for mut candidate in candidates {
             if !EVENT_TYPES.contains(&candidate.event_type.as_str())
                 || !matches!(candidate.confidence.as_str(), "high" | "medium" | "low")
                 || candidate.summary.trim().is_empty()
@@ -521,6 +523,8 @@ impl Project {
                 problem = "部分候选缺少可核验的精确原文锚点或必填字段".into();
                 continue;
             }
+            candidate.subjects.sort_unstable();
+            candidate.subjects.dedup();
             if !candidate_keys.insert((
                 candidate.event_type.clone(),
                 candidate.anchor.start_offset,
@@ -669,7 +673,7 @@ impl Project {
         revision_id: &str,
         bigrams: &str,
     ) -> Result<bool> {
-        if bigrams.len() > 32_000_000 {
+        if bigrams.len() > 42_000_000 {
             return Err(invalid("章节检索索引超出上限"));
         }
         let tx = self

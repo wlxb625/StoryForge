@@ -3,7 +3,7 @@ import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { isTauri } from '@tauri-apps/api/core'
 import {
   ArrowDown, ArrowLeft, ArrowRight, ArrowUp, BookOpen, ChevronDown, CircleAlert,
-  Beaker, BookMarked, Clock3, Copy, FilePlus2, FolderOpen, Library, PanelRight, PenLine, Plus, Route, Settings2, Sparkles, Square, X,
+  Beaker, Binoculars, BookMarked, Clock3, Copy, FilePlus2, FolderOpen, Library, PanelRight, PenLine, Plus, Route, Settings2, Sparkles, Square, X,
 } from 'lucide-vue-next'
 import ModelSettings from './components/ModelSettings.vue'
 import SceneControls from './components/SceneControls.vue'
@@ -11,6 +11,7 @@ import PacksView from './views/PacksView.vue'
 import LabView from './views/LabView.vue'
 import MemoryView from './views/MemoryView.vue'
 import OutlineView from './views/OutlineView.vue'
+import PanoramaView from './views/PanoramaView.vue'
 import EditingTools from './components/EditingTools.vue'
 import { activeTask, type GenerationTask, type TaskState } from './core/contracts/types'
 import { countHan } from './core/quality/hardGate'
@@ -25,7 +26,7 @@ const chapterForm = ref(false)
 const newChapterTitle = ref('')
 const panel = ref<'draft' | 'history' | 'review' | 'editing'>('draft')
 const showInspector = ref(true)
-const view = ref<'studio' | 'packs' | 'lab' | 'memory' | 'outline'>('studio')
+const view = ref<'studio' | 'packs' | 'lab' | 'memory' | 'outline' | 'panorama'>('studio')
 const manuscript = ref<HTMLTextAreaElement>()
 const selection = ref({ start: 0, end: 0 })
 const revisionDialog = ref<HTMLDialogElement>()
@@ -67,6 +68,13 @@ async function locate(chapterId: string, quote: string, preferred?: number) {
 function readSelection() {
   const editor = manuscript.value
   if (editor) selection.value = { start: editor.selectionStart, end: editor.selectionEnd }
+}
+async function showReview(chapterId: string) {
+  if (studio.chapterId !== chapterId) await studio.openChapter(chapterId)
+  if (studio.chapterId !== chapterId || studio.error) return
+  view.value = 'studio'
+  panel.value = 'review'
+  showInspector.value = true
 }
 function chooseRevision() {
   if (!studio.dirty || studio.busy) return
@@ -162,6 +170,7 @@ async function copyDraft(task: GenerationTask) {
         <button class="flat-button" :class="{ selected: view === 'studio' }" type="button" aria-label="写作台" @click="view = 'studio'"><PenLine :size="16" /><span>写作台</span></button>
         <button class="flat-button" :class="{ selected: view === 'memory' }" type="button" aria-label="记忆库" @click="reviewEventId = ''; view = 'memory'"><BookMarked :size="16" /><span>记忆库</span><i v-if="studio.memoryPending" class="review-dot"></i></button>
         <button class="flat-button" :class="{ selected: view === 'outline' }" type="button" aria-label="大纲" @click="view = 'outline'"><Route :size="16" /><span>大纲</span></button>
+        <button class="flat-button" :class="{ selected: view === 'panorama' }" type="button" aria-label="全景" @click="view = 'panorama'"><Binoculars :size="16" /><span>全景</span><i v-if="studio.batch?.state === 'paused'" class="review-dot"></i></button>
         <button class="flat-button" :class="{ selected: view === 'packs' }" type="button" aria-label="卡带与配方" @click="view = 'packs'"><Library :size="16" /><span>配方</span></button>
         <button class="flat-button" :class="{ selected: view === 'lab' }" type="button" aria-label="实验室" @click="view = 'lab'"><Beaker :size="16" /><span>实验室</span></button>
       </nav>
@@ -198,6 +207,7 @@ async function copyDraft(task: GenerationTask) {
     <LabView v-else-if="view === 'lab'" />
     <MemoryView v-else-if="view === 'memory'" :review-event-id="reviewEventId" @open="locate" />
     <OutlineView v-else-if="view === 'outline'" />
+    <PanoramaView v-else-if="view === 'panorama'" @open="locate" @review="showReview" />
     <main v-else class="studio-layout" :class="{ compact: !showInspector }">
       <aside class="chapter-pane" aria-label="章节目录">
         <div class="aside-head"><strong>章节</strong><button type="button" class="icon-button" aria-label="添加章节" @click="chapterForm = !chapterForm"><Plus :size="18" /></button></div>

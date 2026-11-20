@@ -2,6 +2,7 @@ import { invoke, isTauri } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import type { Audience, Candidate, Canon, Knowledge, Memory, MemoryRoles, Note, SearchHit } from '../narrative/memory'
 import type { Pivot, PivotPreview, StageArc } from '../narrative/editing'
+import type { Batch, BatchInput } from '../tasks/batch'
 import type {
   Capabilities, Chapter, GenerationTask, ModelProfile, ProbeResult, ProfileInput, Project, Revision,
   RevisionInput, TaskEvent, TaskInput, Pack, StyleCatalog, Scene, SceneInput, PromptRevision, Trace,
@@ -69,6 +70,16 @@ export const desktop = {
   previewPivot: (arcId: string) => call<PivotPreview>('preview_pivot', { arcId }),
   applyPivot: (pivot: Pivot) => call<StageArc>('apply_pivot', { pivot }),
   applyPolish: (taskId: string, canonConfirmed: boolean) => call<Revision>('apply_polish', { taskId, canonConfirmed }),
+  exportProject: (format: 'story' | 'docx' | 'epub') => call<string | null>('export_project', { format }),
+  latestBatch: () => call<Batch | null>('latest_batch'),
+  startBatch: (input: BatchInput) => call<Batch>('start_batch', { input }),
+  controlBatch: (batchId: string, action: 'pause' | 'resume' | 'stop', budgetUsd?: number, reason?: string) =>
+    call<Batch>('control_batch', { batchId, action, budgetUsd: budgetUsd ?? null, reason: reason ?? null }),
+  reserveBatchStep: (batchId: string, taskId: string, profileId: string) => call<Batch>('reserve_batch_step', { batchId, taskId, profileId }),
+  adoptBatchDraft: (batchId: string, taskId: string) => call<Revision>('adopt_batch_draft', { batchId, taskId }),
+  settleBatchStep: (batchId: string, taskId: string, problem: string, passed: boolean) =>
+    call<Batch>('settle_batch_step', { batchId, taskId, problem, passed }),
+  advanceBatch: (batchId: string) => call<Batch>('advance_batch', { batchId }),
   listen: (onEvent: (event: TaskEvent) => void) =>
     listen<TaskEvent>('storyforge-task', ({ payload }) => onEvent(payload)),
 }

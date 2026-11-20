@@ -175,13 +175,16 @@ export function extractCandidates(text: string, content: string) {
 
 export interface Finding { severity: 'severe' | 'notice'; message: string; anchor: Anchor; suggestion: string }
 export function auditFindings(text: string, content: string): Finding[] {
-  return jsonList(text, 'findings').flatMap(value => {
+  const values = jsonList(text, 'findings')
+  const findings: Finding[] = values.flatMap(value => {
     if (!object(value)) return []
     const anchor = sourceAnchor(content, value.quote, value.occurrence)
     const { severity, message, suggestion } = value
     return anchor && (severity === 'severe' || severity === 'notice') && typeof message === 'string' && message.trim()
       && typeof suggestion === 'string' ? [{ anchor, severity, message, suggestion }] : []
   })
+  if (findings.length !== values.length) throw new Error('部分审查意见缺少精确原文证据。')
+  return findings
 }
 
 export function analysisContext(
@@ -204,9 +207,21 @@ export function memoryAnalysis(
   profile: ModelProfile, memory: Memory, povCharacterId?: string,
 ) {
   const extraction = mode === 'memory_extract'
-  const canon = memory.canon.map(entry => extraction
+  const mentions = (terms: string[]) => terms.some(term => term.length > 0 && revision.content.includes(term))
+  const orderedCanon = [...memory.canon].sort((a, b) =>
+    Number(mentions([b.name, ...b.aliases, ...b.audience.protectedTerms]))
+      - Number(mentions([a.name, ...a.aliases, ...a.audience.protectedTerms]))
+      || Number(b.locked) - Number(a.locked))
+  const canon = orderedCanon.slice(0, 100).map(entry => extraction
     ? { id: entry.entryId, category: entry.category, name: entry.name, aliases: entry.aliases }
-    : entry)
+    : { ...entry, body: Array.from(entry.body).slice(0, 260).join('') })
+  const knownEvents = memory.events.filter(event => isApproved(event) && event.current && event.chapterOrder <= chapter.chapterOrder)
+  const newest = knownEvents.slice(-26)
+  const linked = knownEvents.filter(event => event.subjects.some(id => orderedCanon.slice(0, 12)
+    .some(entry => entry.entryId === id && mentions([entry.name, ...entry.aliases])))).slice(-22)
+  const selected = new Map([...linked, ...newest].map(fact => [fact.eventId, fact]))
+  const facts = [...selected.values()].map(({ eventId, summary, eventType, chapterOrder, audience, subjects }) =>
+    ({ eventId, summary: Array.from(summary).slice(0, 240).join(''), eventType, chapterOrder, audience, subjects }))
   const prompt = [
     extraction ? '你是证据提取器。仅从给定的已确认原文提取事实，不使用常识补全。'
       : '你是旁白一致性审查员。下方包含作者全知数据。只审查事实冲突和视角泄密，勿续写或编辑正文。',
@@ -219,10 +234,11 @@ export function memoryAnalysis(
         + 'quote 必须逐字引用原文，最长120字，重复时标明 occurrence（从1起）。符合设定则返回空数组。',
     '设定：' + JSON.stringify(canon),
     extraction ? '' : '本场景视角人物 ID：' + (povCharacterId || '未指定') + '\n已采纳事实与知情状态：'
-      + JSON.stringify({ events: memory.events.filter(event => isApproved(event) && event.current && event.chapterOrder <= chapter.chapterOrder),
-        knowledge: memory.knowledge, notes: memory.notes }),
+      + JSON.stringify({ events: facts, knowledge: memory.knowledge.filter(item => selected.has(item.eventId)).slice(-40),
+        notes: memory.notes.filter(item => ['open','reminded'].includes(item.status)).slice(-10)
+          .map(note => ({ ...note, body: Array.from(note.body).slice(0, 220).join('') })) }),
     '正式修订全文：\n' + revision.content,
   ].filter(Boolean).join('\n\n')
   return analysisContext(project, chapter, revision, profile, prompt,
-    extraction ? {} : Object.fromEntries(memory.canon.map(entry => [entry.entryId, entry.version])))
+    extraction ? {} : Object.fromEntries(orderedCanon.slice(0, 100).map(entry => [entry.entryId, entry.version])))
 }

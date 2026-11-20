@@ -113,13 +113,14 @@ export interface FrozenContext {
   comparison?: { id: string; label: 'A' | 'B' }
   rates?: Rates | null
   span?: EditSpan
+  batchId?: string
 }
 
 export interface TaskInput {
   idempotencyKey: string
   chapterId: string
   baseRevisionId: string | null
-  taskType: 'beat_write' | 'ab_write' | 'skill_extract' | 'memory_extract' | 'consistency_check' | 'polish_span' | 'critic'
+  taskType: 'beat_write' | 'ab_write' | 'skill_extract' | 'memory_extract' | 'consistency_check' | 'polish_span' | 'critic' | 'batch_write'
   frozenContext: FrozenContext
 }
 

@@ -1,9 +1,11 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod batch_commands;
 mod catalog_commands;
 mod db;
 mod editing_commands;
 mod error;
+mod exports;
 mod memory_commands;
 mod profiles;
 mod remote;
@@ -68,6 +70,17 @@ fn swap_project(app: &AppHandle, load: impl FnOnce() -> Result<Project>) -> Resu
         ));
     }
     let mut active = guard(&studio.project)?;
+    if let Some(current) = active.as_ref() {
+        if current
+            .latest_batch()?
+            .is_some_and(|batch| batch.state == "running")
+        {
+            return Err(StudioError::new(
+                409,
+                "后台批次正在运行，请先暂停再切换工程",
+            ));
+        }
+    }
     let mut project = load()?;
     project.recover()?;
     let info = project.info.clone();
@@ -132,7 +145,16 @@ fn close_project(studio: State<'_, Studio>) -> Result<()> {
     if !streams.is_empty() {
         return Err(StudioError::new(409, "续写任务仍在运行"));
     }
-    *guard(&studio.project)? = None;
+    let mut project = guard(&studio.project)?;
+    if let Some(current) = project.as_ref() {
+        if current
+            .latest_batch()?
+            .is_some_and(|batch| batch.state == "running")
+        {
+            return Err(StudioError::new(409, "请先暂停后台批次再关闭工程"));
+        }
+    }
+    *project = None;
     Ok(())
 }
 
@@ -316,6 +338,7 @@ fn llm_stream_start(app: AppHandle, studio: State<'_, Studio>, task_id: String) 
         let task = project.task(&task_id)?;
         if task.state == "queued" {
             project.check_writer_stamp(&task)?;
+            project.check_batch_dispatch(&task)?;
         }
         Ok(task)
     })?;
@@ -428,7 +451,15 @@ fn main() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_sql::Builder::default().build())
         .setup(|app| {
-            let profile_file = app.path().app_config_dir()?.join("model-profiles.json");
+            let executable = std::env::current_exe()?;
+            let portable = executable
+                .parent()
+                .filter(|path| path.join("portable.flag").is_file());
+            let settings = match portable {
+                Some(path) => path.join("settings"),
+                None => app.path().app_config_dir()?,
+            };
+            let profile_file = settings.join("model-profiles.json");
             let remote = Remote::new().map_err(|error| std::io::Error::other(error.message))?;
             app.manage(Studio {
                 project: Mutex::new(None),
@@ -501,6 +532,14 @@ fn main() {
             editing_commands::preview_pivot,
             editing_commands::apply_pivot,
             editing_commands::apply_polish,
+            exports::export_project,
+            batch_commands::latest_batch,
+            batch_commands::start_batch,
+            batch_commands::control_batch,
+            batch_commands::reserve_batch_step,
+            batch_commands::adopt_batch_draft,
+            batch_commands::settle_batch_step,
+            batch_commands::advance_batch,
             new_project,
             open_project,
             rename_project,
